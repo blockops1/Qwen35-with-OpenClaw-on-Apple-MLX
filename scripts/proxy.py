@@ -14,16 +14,17 @@ Configure MODEL_ALIASES and LOG_FILE below before running.
 """
 import asyncio
 import json
+import os
 import re
 import uuid
 import datetime
 import aiohttp
 from aiohttp import web
 
-BACKEND = "http://127.0.0.1:8091"   # vllm-mlx port
-PORT = 8080                          # proxy listen port
-LOG_FILE = "/tmp/proxy.log"          # change to your preferred log path
-HEARTBEAT_INTERVAL = 5               # seconds between SSE keepalive chunks
+BACKEND = "http://127.0.0.1:8091"              # vllm-mlx port
+PORT = 8080                                    # proxy listen port
+LOG_FILE = os.path.expanduser("~/mlx-server/proxy.log")  # persistent log path
+HEARTBEAT_INTERVAL = 5                         # seconds between SSE keepalive chunks
 
 # Add your model aliases here — friendly name → full path to MLX model directory
 MODEL_ALIASES = {

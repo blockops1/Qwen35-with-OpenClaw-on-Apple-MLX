@@ -26,8 +26,12 @@ Built on [vllm-mlx (waybarrios fork)](https://github.com/waybarrios/vllm-mlx) + 
 
 - Apple Silicon Mac (M1 or later)
 - macOS 13+
-- Homebrew + Python 3.11+ (Homebrew)
+- [Homebrew](https://brew.sh) + Python 3.11+ (Homebrew: `brew install python`)
+- `git-lfs` for model downloads: `brew install git-lfs && git lfs install`
+- Python packages: `aiohttp`, `requests` (installed in steps below)
 - A Qwen3.5 MLX 4-bit model from [mlx-community](https://huggingface.co/mlx-community)
+
+> **Note on `--break-system-packages`:** This flag is for Homebrew Python 3.11+. If you're on a different Python setup, omit it or use a virtual environment.
 
 ---
 
@@ -43,7 +47,12 @@ pip3 install git+https://github.com/waybarrios/vllm-mlx.git --break-system-packa
 
 ### 2. Download a model
 
+> ⚠️ Models are large files stored with Git LFS. Make sure `git lfs install` has been run first, or the clone will download small pointer files instead of actual weights.
+
 ```bash
+# One-time setup
+brew install git-lfs && git lfs install
+
 mkdir -p ~/mlx-models && cd ~/mlx-models
 
 # Recommended: Qwen3.5-27B (coding + tool use, ~14GB, needs 32GB+ RAM)
@@ -63,8 +72,19 @@ python3 scripts/detect_flag.py ~/mlx-models/YOUR-MODEL-NAME
 
 Output tells you exactly which flag to use:
 ```
-Vision weights: 0
-✅ Use: --continuous-batching
+Model:  Qwen3.5-9B-Instruct-4bit
+File:   model.safetensors
+Weights: 0 vision-related
+
+✅ Use flag:  --continuous-batching
+   Engine:    Batched engine (text-only, faster, prefix cache works)
+
+vllm-mlx serve command:
+  vllm-mlx serve /path/to/model \
+    --host 0.0.0.0 --port 8091 \
+    --continuous-batching \
+    --tool-call-parser hermes \
+    --enable-auto-tool-choice
 ```
 
 | Model | Vision weights | Flag |
@@ -79,8 +99,9 @@ Vision weights: 0
 Edit `scripts/start_vllm.sh` — set your model path and flag:
 
 ```bash
+mkdir -p ~/bin
 cp scripts/start_vllm.sh ~/bin/start_vllm.sh
-# Edit MODEL_PATH and VLLM_FLAG
+# Edit MODEL_PATH and VLLM_FLAG inside the file
 chmod +x ~/bin/start_vllm.sh
 ~/bin/start_vllm.sh
 ```
@@ -88,10 +109,11 @@ chmod +x ~/bin/start_vllm.sh
 ### 5. Configure and start the proxy
 
 ```bash
-pip3 install aiohttp --break-system-packages
+pip3 install aiohttp requests --break-system-packages
 
+mkdir -p ~/mlx-server
 cp scripts/proxy.py ~/mlx-server/proxy.py
-# Edit MODEL_ALIASES at the top of the file
+# Edit BACKEND, PORT, LOG_FILE, and MODEL_ALIASES at the top of the file
 python3 ~/mlx-server/proxy.py
 ```
 
