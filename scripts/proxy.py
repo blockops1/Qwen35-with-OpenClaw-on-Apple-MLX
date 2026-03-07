@@ -1,56 +1,63 @@
 """
-proxy.py — Async proxy for vllm-mlx (Qwen3.5 on Apple MLX)
+MLX-VLM Async Proxy for Jill
+- Maps model alias 'qwen35' to local model path
+- Injects Qwen-Agent system prompt for tool calling
+- Parses <tool_call> tags and converts to OpenAI tool_calls format
+- Streams SSE heartbeat chunks during tool requests to keep Telegram socket alive
+Port 8080 → forwards to vllm-mlx on port 8091
 
-Provides full OpenAI API compatibility with:
-  - Model alias rewriting (friendly name → local model path)
-  - Tool calling: Qwen-Agent XML prompt injection + <tool_call> response parsing
-  - SSE heartbeat keepalives (prevents socket timeouts during long prefills)
-  - Thinking token suppression (<think>…</think> and 'Thinking Process:' stripped)
-  - Structured request/response logging
-
-Port 8080 (proxy) → forwards to vllm-mlx on port 8091
-
-Configure MODEL_ALIASES and LOG_FILE below before running.
+Log file: /Users/jill/mlx-server/proxy-qwen35.log
 """
 import asyncio
 import json
-import os
 import re
 import uuid
 import datetime
 import aiohttp
+import psutil
 from aiohttp import web
 
-BACKEND = "http://127.0.0.1:8091"              # vllm-mlx port
-PORT = 8080                                    # proxy listen port
-LOG_FILE = os.path.expanduser("~/mlx-server/proxy.log")  # persistent log path
-HEARTBEAT_INTERVAL = 5                         # seconds between SSE keepalive chunks
-COLD_START_WARN_S  = 60                        # seconds before emitting cold-start warning to client
+DEFAULT_BACKEND = "http://127.0.0.1:8091"
+PORT = 8080
+LOG_FILE = "/Users/jill/mlx-server/proxy-qwen35.log"
+HEARTBEAT_INTERVAL = 5   # seconds between SSE keepalive chunks
+COLD_START_WARN_S  = 60  # seconds before emitting cold-start warning to client
 
-# Add your model aliases here — friendly name → full path to MLX model directory
 MODEL_ALIASES = {
-    "qwen35": "/Users/yourname/mlx-models/Qwen3.5-27B-4bit",
-    # "qwen9b": "/Users/yourname/mlx-models/Qwen3.5-9B-Instruct-4bit",
+    "qwen35":           "/Users/jill/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",  # active: distilled 2026-03-07
+    "qwen35-base":      "/Users/jill/mlx-models/Qwen3.5-27B-4bit",                                  # inactive: base VLM
 }
-ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
+# Per-alias backend override — only needed when running a second server on a different port
+MODEL_BACKENDS = {}
 
-# Request size limits — prevent runaway sessions from hanging vllm-mlx
-# A 42K-token request takes 300s+ to process, causing a timeout that locks
-# the model and kills all concurrent sessions. Fail fast with 413 instead.
-MAX_INPUT_TOKENS = 35000   # estimated from message content (~4 chars/token)
+# Request size limits — prevent runaway sessions from hanging the model
+MAX_INPUT_TOKENS = 35000   # ~140k chars; hard reject above this
 MAX_MESSAGES    = 300      # runaway session guard
 
-# Concurrency limit — prevent request pile-up from saturating vllm-mlx KV cache.
-# Even legitimately-sized requests exhaust KV cache if too many run concurrently.
-# With a large OpenClaw system prompt (~18-20K tokens), each request consumes
-# ~1GB of KV cache. Tune MAX_CONCURRENT to fit your hardware:
-#   16GB + 9B model  → 1
-#   32GB + 9B model  → 2-3
-#   64GB + 27B model → 1 (recommended); 2 if system prompts are small
-#   64GB + 9B model  → 3-4
-# A 429 response triggers OpenClaw's model fallback (e.g. to Claude) automatically.
-MAX_CONCURRENT  = 1        # max simultaneous in-flight backend requests
-_inflight       = 0        # current in-flight count (asyncio single-thread safe)
+# Concurrency limit — prevent request pile-up from saturating vllm-mlx
+MAX_CONCURRENT  = 2        # max simultaneous in-flight backend requests
+# Tune by hardware: 64GB+27B→2, 64GB+9B→4, 32GB+9B→2-3 (429 → Claude fallback)
+_inflight       = 0        # current count (guarded by asyncio single-thread)
+
+# Memory warning thresholds — warnings only, no enforcement (testing mode)
+# Tiers are fractions of TOTAL_RAM, measured at startup — portable across machines.
+TOTAL_RAM_BYTES = psutil.virtual_memory().total
+TOTAL_RAM_GB    = TOTAL_RAM_BYTES / (1024 ** 3)  # GiB — matches OS/Apple reported value
+
+MEM_WARN_TIERS = [
+    # (available_fraction_of_total, short_label, full_message)  — highest severity first
+    # Calibrated for model-loaded baseline (~77% used on 64GB, ~60% on 128GB)
+    (0.05, "Crash likely imminent — save work NOW",
+           "🚨 *Memory CRITICAL* — only {avail:.1f} GB free ({pct:.0f}% of {total:.0f} GB). Crash likely imminent. Save work now."),
+    (0.10, "High pressure — /compact or /new soon",
+           "🔴 *Memory HIGH* — {avail:.1f} GB free ({pct:.0f}% of {total:.0f} GB). High pressure — consider /compact or /new soon."),
+    (0.15, "Session growing large",
+           "⚠️ *Memory WARNING* — {avail:.1f} GB free ({pct:.0f}% of {total:.0f} GB). Session growing large."),
+    (0.20, "Session is getting long",
+           "⚡ *Memory NOTICE* — {avail:.1f} GB free ({pct:.0f}% of {total:.0f} GB). Session is getting long."),
+]
+
+ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
 
 QWEN_TOOL_SYSTEM = """\
 # Tools
@@ -77,6 +84,50 @@ def log(msg):
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
+
+
+def make_session_start_notice(avail_gb: float) -> str:
+    """
+    Startup notice injected into the first response of every session.
+    Lists warning tiers calculated from TOTAL_RAM_GB so they auto-scale per machine.
+    """
+    lines = ["⚙️ *[TESTING MODE] Compaction is disabled.*",
+             f"This session will grow until memory runs out. "
+             f"Start a new session (/new) before you hit the limit.\n",
+             f"Memory warnings will appear at (machine total: {TOTAL_RAM_GB:.0f} GB):"]
+    # Print tiers least-severe → most-severe
+    for frac, label, msg_template in reversed(MEM_WARN_TIERS):
+        threshold_gb = TOTAL_RAM_GB * frac
+        emoji = msg_template.split()[0]
+        lines.append(f"  {emoji} < {frac*100:.0f}% free  (< {threshold_gb:.1f} GB)  — {label}")
+    lines.append(f"\nCurrent: {avail_gb:.1f} GB free of {TOTAL_RAM_GB:.0f} GB "
+                 f"({avail_gb/TOTAL_RAM_GB*100:.0f}% free)\n"
+                 "─────────────────────────────────")
+    return "\n".join(lines) + "\n\n"
+
+
+def get_memory_warning() -> tuple[str | None, float]:
+    """
+    Check system available RAM as fraction of total (measured at startup).
+    Returns (warning_text, available_gb) or (None, available_gb).
+    No enforcement — warnings only during testing phase.
+    """
+    try:
+        mem = psutil.virtual_memory()
+        available_gb   = mem.available / (1024 ** 3)  # GiB
+        available_frac = mem.available / TOTAL_RAM_BYTES
+        used_pct       = mem.percent
+        log(f"MEM_CHECK available={available_gb:.1f}GB ({available_frac*100:.0f}% free) "
+            f"used={used_pct:.0f}% total={TOTAL_RAM_GB:.0f}GB")
+        for threshold_frac, _label, msg_template in MEM_WARN_TIERS:
+            if available_frac < threshold_frac:
+                msg = msg_template.format(avail=available_gb, total=TOTAL_RAM_GB, pct=available_frac*100)
+                log(f"MEM_WARN tier=<{threshold_frac*100:.0f}% available={available_gb:.1f}GB")
+                return msg, available_gb
+        return None, available_gb
+    except Exception as e:
+        log(f"MEM_CHECK_ERROR {e}")
+        return None, 0.0
 
 
 def estimate_tokens(char_count):
@@ -155,9 +206,10 @@ def rewrite_response(resp_data: dict) -> dict:
     return resp_data
 
 
-async def fetch_backend_blocking(body_bytes: bytes, headers: dict, path_qs: str):
+async def fetch_backend_blocking(body_bytes: bytes, headers: dict, path_qs: str, alias: str = None):
     """Non-streaming backend fetch. Returns (bytes, status_int)."""
-    url = BACKEND + path_qs
+    backend = MODEL_BACKENDS.get(alias, DEFAULT_BACKEND)
+    url = backend + path_qs
     try:
         async with aiohttp.ClientSession() as session:
             async with session.request(
@@ -195,7 +247,7 @@ async def safe_write(response: web.StreamResponse, data: bytes, label: str = "")
         return False
 
 
-async def handle_tool_stream(request: web.Request, data: dict, headers: dict, body_bytes: bytes):
+async def handle_tool_stream(request: web.Request, data: dict, headers: dict, body_bytes: bytes, session_start: bool = False):
     """
     Tool-call path:
     1. Open SSE stream to client immediately
@@ -217,14 +269,24 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
     )
     await response.prepare(request)
 
+    # Session start notice — injected into first response only
+    mem_warning, avail_gb = get_memory_warning()
+    if session_start:
+        notice = make_session_start_notice(avail_gb)
+        notice_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": notice})
+        await safe_write(response, notice_chunk, "session-start-notice")
+    elif mem_warning:
+        # Memory warning — only if not already showing session start notice
+        warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": f"{mem_warning}\n\n"})
+        await safe_write(response, warn_chunk, "mem-warn")
+
     # Launch backend request concurrently
     backend_task = asyncio.create_task(
-        fetch_backend_blocking(body_bytes, headers, request.path_qs)
+        fetch_backend_blocking(body_bytes, headers, request.path_qs, alias=model_alias)
     )
 
-    # Send heartbeat chunks until backend responds.
-    # After COLD_START_WARN_S seconds, emit a visible warning so the user knows
-    # the model is doing a cold prefill (not hung) and to expect a slow first response.
+    # Send heartbeat chunks until backend responds
+    # After COLD_START_WARN_S seconds, emit a visible warning to the client
     elapsed_heartbeat = 0
     cold_start_warned  = False
     try:
@@ -328,7 +390,7 @@ async def handle(request: web.Request) -> web.Response:
 
     requested_model = data.get("model", "<none>") if data else "<no-body>"
     log(f"INBOUND method={request.method} path={request.path_qs} "
-        f"body_len={len(body_bytes)} model={requested_model} is_chat={is_chat}")
+        f"body_len={len(body_bytes)} model={requested_model} is_chat={is_chat} peer={request.remote}")
 
     # Handle /v1/models/{alias} — OpenClaw hits this when switching models
     # vllm-mlx doesn't have this endpoint; return a synthetic model object
@@ -350,7 +412,7 @@ async def handle(request: web.Request) -> web.Response:
 
     if not is_chat:
         # Passthrough for health checks, models list, etc.
-        url = BACKEND + request.path_qs
+        url = DEFAULT_BACKEND + request.path_qs
         log(f"PASSTHROUGH → {url}")
         try:
             async with aiohttp.ClientSession() as session:
@@ -376,7 +438,7 @@ async def handle(request: web.Request) -> web.Response:
     tools = data.pop("tools", None)
     data.pop("tool_choice", None)
 
-    # Concurrency guard — reject immediately if too many requests in flight
+    # Concurrency guard — reject if too many requests already in flight
     global _inflight
     if _inflight >= MAX_CONCURRENT:
         log(f"CONCURRENCY_REJECTED inflight={_inflight} limit={MAX_CONCURRENT} messages={len(messages)}")
@@ -409,13 +471,19 @@ async def handle(request: web.Request) -> web.Response:
                     "message": (
                         f"Request too large: ~{est_tokens_guard} tokens / {len(messages)} messages. "
                         f"Limits: {MAX_INPUT_TOKENS} tokens, {MAX_MESSAGES} messages. "
-                        "Start a new session."
+                        "Start a new session (/new)."
                     ),
                     "type": "request_too_large",
                     "code": 413,
                 }
             }).encode()
         )
+
+    # Session start detection — first user message (system + 1 user msg = new session)
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    is_session_start = len(user_msgs) == 1
+    if is_session_start:
+        log("SESSION_START detected — will inject startup notice")
 
     if tools:
         tool_system = build_tool_system_prompt(tools)
@@ -439,7 +507,7 @@ async def handle(request: web.Request) -> web.Response:
         _inflight += 1
         log(f"INFLIGHT_INC count={_inflight}")
         try:
-            return await handle_tool_stream(request, data, headers, body_bytes)
+            return await handle_tool_stream(request, data, headers, body_bytes, session_start=is_session_start)
         finally:
             _inflight -= 1
             log(f"INFLIGHT_DEC count={_inflight}")
@@ -462,7 +530,8 @@ async def handle(request: web.Request) -> web.Response:
         f"max_tokens={data.get('max_tokens','?')} tools=False")
 
     body_bytes = json.dumps(data).encode()
-    url = BACKEND + request.path_qs
+    backend = MODEL_BACKENDS.get(original_model, DEFAULT_BACKEND)
+    url = backend + request.path_qs
 
     _inflight += 1
     log(f"INFLIGHT_INC count={_inflight}")
@@ -486,6 +555,14 @@ async def handle(request: web.Request) -> web.Response:
                         msg = choice.get("message", {})
                         if msg.get("content"):
                             msg["content"] = strip_thinking(msg["content"])
+                    # Prepend session start notice or memory warning
+                    mem_warning, avail_gb = get_memory_warning()
+                    first_msg = resp_data.get("choices", [{}])[0].get("message", {})
+                    orig = first_msg.get("content") or ""
+                    if is_session_start:
+                        first_msg["content"] = make_session_start_notice(avail_gb) + orig
+                    elif mem_warning:
+                        first_msg["content"] = f"{mem_warning}\n\n{orig}"
                     # Alias rewrite
                     resp_str = json.dumps(resp_data)
                     for path, alias in ALIAS_REVERSE.items():
@@ -518,8 +595,8 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log(f"Listening on 0.0.0.0:{PORT} → {BACKEND}")
-    print(f"MLX-VLM async proxy on 0.0.0.0:{PORT} → {BACKEND}")
+    log(f"Listening on 0.0.0.0:{PORT} → default={DEFAULT_BACKEND} aliases={list(MODEL_ALIASES.keys())}")
+    print(f"MLX-VLM async proxy on 0.0.0.0:{PORT} → default={DEFAULT_BACKEND}")
     print(f"Aliases: {list(MODEL_ALIASES.keys())}")
     await asyncio.Event().wait()
 
