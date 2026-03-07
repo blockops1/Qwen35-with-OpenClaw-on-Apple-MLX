@@ -13,6 +13,7 @@ import json
 import re
 import uuid
 import datetime
+import time
 import aiohttp
 import psutil
 from aiohttp import web
@@ -30,9 +31,7 @@ MODEL_ALIASES = {
 # Per-alias backend override — only needed when running a second server on a different port
 MODEL_BACKENDS = {}
 
-# Request size limits — prevent runaway sessions from hanging the model
-MAX_INPUT_TOKENS = 35000   # ~140k chars; hard reject above this
-MAX_MESSAGES    = 300      # runaway session guard
+MAX_MESSAGES    = 300      # runaway session guard (belt-and-suspenders)
 
 # Concurrency limit — prevent request pile-up from saturating vllm-mlx
 MAX_CONCURRENT  = 2        # max simultaneous in-flight backend requests
@@ -396,7 +395,6 @@ async def handle(request: web.Request) -> web.Response:
     # vllm-mlx doesn't have this endpoint; return a synthetic model object
     if request.method == "GET" and request.path.startswith("/v1/models/"):
         model_id = request.path[len("/v1/models/"):]
-        import time
         model_obj = {
             "id": model_id,
             "object": "model",
@@ -457,22 +455,15 @@ async def handle(request: web.Request) -> web.Response:
             }).encode()
         )
 
-    # Request size guard — fail fast before model hangs
-    total_chars_guard = sum(len(m.get("content", "") or "") for m in messages)
-    est_tokens_guard  = estimate_tokens(total_chars_guard)
-    if est_tokens_guard > MAX_INPUT_TOKENS or len(messages) > MAX_MESSAGES:
-        log(f"REQUEST_REJECTED est_tokens={est_tokens_guard} messages={len(messages)} "
-            f"— exceeds limits (max_tokens={MAX_INPUT_TOKENS} max_messages={MAX_MESSAGES})")
+    # Message count guard — catch truly runaway sessions
+    if len(messages) > MAX_MESSAGES:
+        log(f"REQUEST_REJECTED messages={len(messages)} — exceeds MAX_MESSAGES={MAX_MESSAGES}")
         return web.Response(
             status=413,
             content_type="application/json",
             body=json.dumps({
                 "error": {
-                    "message": (
-                        f"Request too large: ~{est_tokens_guard} tokens / {len(messages)} messages. "
-                        f"Limits: {MAX_INPUT_TOKENS} tokens, {MAX_MESSAGES} messages. "
-                        "Start a new session (/new)."
-                    ),
+                    "message": f"Too many messages ({len(messages)}). Start a new session (/new).",
                     "type": "request_too_large",
                     "code": 413,
                 }
