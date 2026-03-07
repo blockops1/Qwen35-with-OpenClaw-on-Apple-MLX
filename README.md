@@ -79,6 +79,8 @@ git clone https://huggingface.co/mlx-community/Qwen3.5-27B-4bit
 git clone https://huggingface.co/mlx-community/Qwen3.5-9B-Instruct-4bit
 ```
 
+See [Tested Models](#tested-models) below for models confirmed working with this stack, including a Claude-distilled variant with significantly improved reasoning.
+
 ### 3. Detect the right startup flag for your model
 
 `Qwen3_5ForConditionalGeneration` appears in ALL Qwen3.5 configs — it does **not** mean the model has a vision tower. Always check the actual weights:
@@ -321,9 +323,39 @@ CI-friendly: exits 0 on full pass, 1 on any failure.
 
 ---
 
+## Tested Models
+
+Models confirmed working with this stack on Apple Silicon. All require the [waybarrios vllm-mlx fork](https://github.com/waybarrios/vllm-mlx).
+
+| Model | Download | RAM | Flag | Notes |
+|-------|----------|-----|------|-------|
+| **Qwen3.5-27B-Claude-4.6-Opus-Distilled** | [mlx-community](https://huggingface.co/mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit) | 64GB | `--continuous-batching` | ⭐ **Recommended for 64GB.** Distilled from Claude 4.6 Opus reasoning traces. Noticeably better instruction following and tool use than the base model. No vision weights — use `--continuous-batching`, not `--mllm`. |
+| Qwen3.5-27B-4bit | [mlx-community](https://huggingface.co/mlx-community/Qwen3.5-27B-4bit) | 64GB | `--mllm` | Base model with vision weights. Solid baseline. |
+| Qwen3.5-9B-Instruct-4bit | [mlx-community](https://huggingface.co/mlx-community/Qwen3.5-9B-Instruct-4bit) | 16GB | `--continuous-batching` | Best option for 16GB. Fast, good tool calling. |
+| Qwen3.5-9B-4bit | [mlx-community](https://huggingface.co/mlx-community/Qwen3.5-9B-4bit) | 16GB | `--continuous-batching` | Text-only variant of 9B. |
+| Qwen3.5-35B-A3B-4bit | [mlx-community](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) | 64GB | `--mllm` | MoE model. Vision weights present. |
+
+**Downloading the recommended distilled model:**
+```bash
+cd ~/mlx-models
+git clone https://huggingface.co/mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit
+```
+~14GB download. After cloning, run `scripts/detect_flag.py` to confirm the correct flag:
+```bash
+python3 scripts/detect_flag.py ~/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit
+# → Use flag: --continuous-batching
+```
+
+> **Note on the distilled model:** `Qwen3_5ForConditionalGeneration` appears in this model's config (as with all Qwen3.5 models), but it has **no vision weights** in the actual safetensors files. Always use `detect_flag.py` to check — do not assume from the config alone.
+
+---
+
 ## Reference Configurations
 
-### High-performance (Mac mini M4, 64GB)
+### High-performance (Mac mini M4, 64GB) — recommended
+- Model: `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` · Flag: `--continuous-batching` · Cache: `--cache-memory-percent 0.30`
+
+### High-performance (Mac mini M4, 64GB) — base model
 - Model: `Qwen3.5-27B-4bit` · Flag: `--mllm` · Cache: `--cache-memory-percent 0.30`
 
 ### Standard (MacBook, 16GB)
