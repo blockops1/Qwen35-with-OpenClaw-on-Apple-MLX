@@ -25,6 +25,7 @@ BACKEND = "http://127.0.0.1:8091"              # vllm-mlx port
 PORT = 8080                                    # proxy listen port
 LOG_FILE = os.path.expanduser("~/mlx-server/proxy.log")  # persistent log path
 HEARTBEAT_INTERVAL = 5                         # seconds between SSE keepalive chunks
+COLD_START_WARN_S  = 60                        # seconds before emitting cold-start warning to client
 
 # Add your model aliases here — friendly name → full path to MLX model directory
 MODEL_ALIASES = {
@@ -164,7 +165,7 @@ async def fetch_backend_blocking(body_bytes: bytes, headers: dict, path_qs: str)
                 url=url,
                 headers=headers,
                 data=body_bytes,
-                timeout=aiohttp.ClientTimeout(total=600),
+                timeout=aiohttp.ClientTimeout(total=700),
             ) as resp:
                 data = await resp.read()
                 return data, resp.status
@@ -221,7 +222,11 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
         fetch_backend_blocking(body_bytes, headers, request.path_qs)
     )
 
-    # Send heartbeat chunks until backend responds
+    # Send heartbeat chunks until backend responds.
+    # After COLD_START_WARN_S seconds, emit a visible warning so the user knows
+    # the model is doing a cold prefill (not hung) and to expect a slow first response.
+    elapsed_heartbeat = 0
+    cold_start_warned  = False
     try:
         while not backend_task.done():
             heartbeat = make_sse_chunk(request_id, model_alias, {"content": ""})
@@ -231,6 +236,17 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
                 await asyncio.wait_for(asyncio.shield(backend_task), timeout=float(HEARTBEAT_INTERVAL))
                 break  # backend done
             except asyncio.TimeoutError:
+                elapsed_heartbeat += HEARTBEAT_INTERVAL
+                if not cold_start_warned and elapsed_heartbeat >= COLD_START_WARN_S:
+                    cold_start_warned = True
+                    warning_text = (
+                        "⏳ *Cold start detected* — initial prefill in progress. "
+                        "This can take up to 5 minutes on the first request. "
+                        "Subsequent responses in this session will be much faster."
+                    )
+                    warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": warning_text})
+                    await safe_write(response, warn_chunk, "cold-start-warn")
+                    log(f"COLD_START_WARN sent after {elapsed_heartbeat}s")
                 continue  # still waiting, loop again
     except Exception as e:
         log(f"HEARTBEAT_ERROR {e}")

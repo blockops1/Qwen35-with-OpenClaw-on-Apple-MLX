@@ -20,6 +20,10 @@ PORT=8091
 # 64GB machine + 20GB model → 0.30 (19GB cache)
 # 16GB machine + 5GB model  → 0.20 (3.2GB cache)
 CACHE_PERCENT=0.30
+
+# Request timeout in seconds (default 300 is too short for cold prefills
+# of large sessions; 600 gives ~10 min headroom)
+TIMEOUT=600
 # ─────────────────────────────────────────────────────────────
 
 exec vllm-mlx serve "$MODEL_PATH" \
@@ -31,4 +35,5 @@ exec vllm-mlx serve "$MODEL_PATH" \
   --cache-memory-percent "$CACHE_PERCENT" \
   --kv-cache-quantization \
   --kv-cache-quantization-bits 8 \
-  --chunked-prefill-tokens 2048
+  --chunked-prefill-tokens 2048 \
+  --timeout "$TIMEOUT"

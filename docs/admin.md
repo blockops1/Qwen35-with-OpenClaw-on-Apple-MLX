@@ -330,6 +330,31 @@ Standard `mlx_lm` does not support tool calling. This stack implements it entire
 
 ---
 
+## Cold Start Warning
+
+On the first request to a fresh model session, the model must prefill the entire context from scratch (no KV cache). With a large system prompt (~18-20K tokens), this can take 2-5 minutes.
+
+The proxy detects slow responses and emits a visible warning message to the client after 60 seconds:
+
+```
+⏳ Cold start detected — initial prefill in progress.
+This can take up to 5 minutes on the first request.
+Subsequent responses in this session will be much faster.
+```
+
+This message appears inline in the chat (Telegram, etc.) so users know to wait rather than assume the model is broken. Subsequent turns in the same session are fast (15-45 seconds) because the system prompt is prefix-cached.
+
+**Timeout settings to match:**
+```bash
+# vllm-mlx server — increase from default 300s
+--timeout 600
+
+# Proxy aiohttp client timeout (should exceed server timeout)
+aiohttp.ClientTimeout(total=700)
+```
+
+---
+
 ## Request Size Guard
 
 The proxy rejects oversized requests immediately (HTTP 413) rather than passing them to vllm-mlx:
