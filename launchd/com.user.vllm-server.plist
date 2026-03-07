@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist for vllm-mlx server
+  Edit /Users/yourname to your actual home directory before loading.
+
+  Load:    launchctl load ~/Library/LaunchAgents/com.user.vllm-server.plist
+  Restart: launchctl kickstart -k gui/$(id -u)/com.user.vllm-server
+  Logs:    tail -f ~/mlx-server/vllm-server.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.vllm-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/yourname/bin/start_vllm.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/yourname</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/yourname/mlx-server/vllm-server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/yourname/mlx-server/vllm-server.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
