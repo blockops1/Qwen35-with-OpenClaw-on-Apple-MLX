@@ -39,9 +39,16 @@ ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
 MAX_INPUT_TOKENS = 35000   # estimated from message content (~4 chars/token)
 MAX_MESSAGES    = 300      # runaway session guard
 
-# Concurrency limit — prevent request pile-up from saturating vllm-mlx KV cache
-# Even legitimately-sized requests will OOM the model if too many run at once.
-MAX_CONCURRENT  = 2        # max simultaneous in-flight backend requests
+# Concurrency limit — prevent request pile-up from saturating vllm-mlx KV cache.
+# Even legitimately-sized requests exhaust KV cache if too many run concurrently.
+# With a large OpenClaw system prompt (~18-20K tokens), each request consumes
+# ~1GB of KV cache. Tune MAX_CONCURRENT to fit your hardware:
+#   16GB + 9B model  → 1
+#   32GB + 9B model  → 2-3
+#   64GB + 27B model → 1 (recommended); 2 if system prompts are small
+#   64GB + 9B model  → 3-4
+# A 429 response triggers OpenClaw's model fallback (e.g. to Claude) automatically.
+MAX_CONCURRENT  = 1        # max simultaneous in-flight backend requests
 _inflight       = 0        # current in-flight count (asyncio single-thread safe)
 
 QWEN_TOOL_SYSTEM = """\

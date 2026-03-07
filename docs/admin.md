@@ -345,30 +345,58 @@ The guard returns HTTP 413 in milliseconds. Tune `MAX_INPUT_TOKENS` and `MAX_MES
 
 ## Concurrency Limit
 
-The proxy also enforces a maximum number of simultaneous in-flight backend requests:
+The proxy enforces a maximum number of simultaneous in-flight backend requests:
 
 ```python
-MAX_CONCURRENT = 2   # max simultaneous requests to vllm-mlx
+MAX_CONCURRENT = 1   # max simultaneous requests to vllm-mlx
 ```
 
-Requests beyond this limit receive HTTP 429 immediately. This prevents request pile-up from exhausting the KV cache even when individual requests are within the token/message limits.
+Requests beyond this limit receive HTTP 429 immediately. If you have a fallback model configured in OpenClaw (`agents.defaults.model.fallbacks`), a 429 triggers automatic fallback — so concurrent requests spill over to your API model rather than erroring.
 
-**Why this matters:** The batched engine allocates KV cache for all concurrent requests simultaneously. Five moderate requests (each 20K tokens) can exhaust 64GB of RAM just as effectively as one 100K-token request. The concurrency limit is the correct protection layer for this.
+**Why this matters:** The batched engine allocates KV cache for all concurrent requests simultaneously. With a large system prompt (~65-70KB is typical for a well-configured OpenClaw agent), even a single request consumes 18-20K tokens before any conversation history. Two concurrent requests of that size can exhaust available KV cache and cause both to time out.
+
+**Tuning `MAX_CONCURRENT` by hardware:**
+
+| RAM | Model | Recommended MAX_CONCURRENT | Notes |
+|-----|-------|---------------------------|-------|
+| 16GB | 9B (5GB) | 1 | Tight — one at a time |
+| 32GB | 9B (5GB) | 2–3 | Comfortable |
+| 32GB | 27B (14GB) | 1 | Large model, limited headroom |
+| 64GB | 27B (14GB) | 1–2 | 1 recommended with large system prompts; 2 if prompts are small |
+| 64GB | 9B (5GB) | 3–4 | Plenty of headroom |
+| 128GB | 27B (14GB) | 3–4 | Comfortable |
+
+> **Rule of thumb:** `MAX_CONCURRENT = floor((available_RAM - model_size) / (avg_request_tokens × bytes_per_token))`
+> With 8-bit KV cache: ~2 bytes/token/layer × 28 layers = ~56 bytes/token.
+> A 20K-token request ≈ 1.1GB KV cache. A 64GB machine with 27B model (14GB) has ~40GB free → 3–4 slots theoretically, but chunked prefill and generation overhead reduce this in practice.
 
 Log entries: `INFLIGHT_INC`, `INFLIGHT_DEC`, `CONCURRENCY_REJECTED`.
 
 ---
 
-**If using OpenClaw**, prevent sessions from reaching the guard in the first place by setting:
+**If using OpenClaw**, prevent sessions from reaching the guard in the first place with these companion settings:
+
 ```json
 "channels": {
-  "telegram": { "historyLimit": 20 }
+  "telegram": {
+    "historyLimit": 20
+  }
 },
-"agents": { "defaults": { "compaction": {
-  "maxHistoryShare": 0.4
-}}}
+"agents": {
+  "defaults": {
+    "compaction": {
+      "maxHistoryShare": 0.4
+    }
+  }
+}
 ```
-> ⚠️ `historyLimit: 0` means **unlimited** (not zero) in OpenClaw — a common misconfiguration.
+
+| Setting | Recommended | What it does |
+|---------|-------------|--------------|
+| `channels.telegram.historyLimit` | `20` | Caps messages sent to model per request. **`0` = unlimited** (not zero) — common trap. |
+| `compaction.maxHistoryShare` | `0.4` | Compaction fires when history exceeds 40% of context window, preventing unbounded growth. |
+
+> ⚠️ `historyLimit: 0` means **unlimited** in OpenClaw — not zero. This is the most common misconfiguration that causes sessions to grow to 500+ messages and overwhelm the model.
 
 ---
 
