@@ -14,6 +14,7 @@ A production-grade local LLM stack that turns any Apple Silicon Mac into an Open
 - **Tool calling** (function calling) via Qwen-Agent XML prompt injection + structured response parsing
 - **SSE streaming** with heartbeat keepalives — prevents Telegram/websocket timeouts during long prefills
 - **Thinking token suppression** — strips `<think>…</think>` and `Thinking Process:` automatically
+- **Metal OOM protection** — proxy token guard warns at 60K tokens, hard-stops at 70K with a retryable user message before the hardware crash zone (~85K on 64GB)
 - **Multi-agent support** — remote agents on your LAN can use this machine as their model backend
 - **Auto-start on boot** via launchd
 - **Full test suite** — 9 tests including tool call selection, argument validation, alias rewriting
@@ -353,7 +354,7 @@ python3 scripts/detect_flag.py ~/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distille
 ## Reference Configurations
 
 ### High-performance (Mac mini M4, 64GB) — recommended
-- Model: `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` · Flag: `--continuous-batching` · Cache: `--cache-memory-percent 0.30`
+- Model: `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` · Flag: `--continuous-batching` · Cache: `--cache-memory-percent 0.30` · Prefill: `--chunked-prefill-tokens 1024`
 
 ### High-performance (Mac mini M4, 64GB) — base model
 - Model: `Qwen3.5-27B-4bit` · Flag: `--mllm` · Cache: `--cache-memory-percent 0.30`
@@ -374,6 +375,8 @@ python3 scripts/detect_flag.py ~/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distille
 | Tool calls return empty or plain text | `MODEL_ALIASES` path wrong or missing | Check proxy.py config; use absolute path, not `~` |
 | launchd service won't start | Wrong Python path in plist | Run `which python3`, update plist `ProgramArguments` |
 | Port 8080 already in use | Another process on that port | Change `PORT` in proxy.py and PORT in plist |
+| **Server crashes silently, session lost** | **Metal GPU OOM** (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) | **Confirmed crash zone: 51K–85K actual prompt tokens on 64GB.** macOS never fires a memory pressure warning for Metal failures. Set `--chunked-prefill-tokens 1024` (halves peak activation memory). The proxy's token guard (60K warn / 70K hard stop) blocks requests before they reach the crash zone. |
+| Proxy token estimate much lower than actual | Char/token ratio varies by content type (2.5–3.1) | Proxy uses `max(chars/3.0, last_known_actual)` — dense tool results (JSON/code) can be 37%+ more tokens than chars/4 estimate. |
 
 ---
 
