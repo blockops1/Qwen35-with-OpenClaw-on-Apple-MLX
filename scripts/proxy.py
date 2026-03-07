@@ -151,6 +151,18 @@ def inject_tool_prompt(messages: list, tool_system: str) -> list:
     return messages
 
 
+def inject_system_notice(messages: list, notice: str) -> list:
+    """Append notice to the system message so the model sees it as context.
+    Does NOT appear in the assistant response — avoids session history pollution."""
+    messages = [m.copy() for m in messages]
+    for m in messages:
+        if m.get("role") == "system":
+            m["content"] = (m.get("content") or "") + "\n\n" + notice
+            return messages
+    messages.insert(0, {"role": "system", "content": notice})
+    return messages
+
+
 def strip_thinking(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     text = re.sub(r"^Thinking Process:.*?(\n\n|\Z)", "", text, flags=re.DOTALL).strip()
@@ -268,14 +280,9 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
     )
     await response.prepare(request)
 
-    # Session start notice — injected into first response only
+    # Memory warning — emit as SSE chunk if RAM is tight (per-turn, short message)
     mem_warning, avail_gb = get_memory_warning()
-    if session_start:
-        notice = make_session_start_notice(avail_gb)
-        notice_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": notice})
-        await safe_write(response, notice_chunk, "session-start-notice")
-    elif mem_warning:
-        # Memory warning — only if not already showing session start notice
+    if mem_warning:
         warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": f"{mem_warning}\n\n"})
         await safe_write(response, warn_chunk, "mem-warn")
 
@@ -474,7 +481,10 @@ async def handle(request: web.Request) -> web.Response:
     user_msgs = [m for m in messages if m.get("role") == "user"]
     is_session_start = len(user_msgs) == 1
     if is_session_start:
-        log("SESSION_START detected — will inject startup notice")
+        _, avail_gb = get_memory_warning()
+        notice = make_session_start_notice(avail_gb)
+        messages = inject_system_notice(messages, notice)
+        log(f"SESSION_START — notice injected into system message (avail={avail_gb:.1f}GB)")
 
     if tools:
         tool_system = build_tool_system_prompt(tools)
@@ -546,13 +556,11 @@ async def handle(request: web.Request) -> web.Response:
                         msg = choice.get("message", {})
                         if msg.get("content"):
                             msg["content"] = strip_thinking(msg["content"])
-                    # Prepend session start notice or memory warning
+                    # Prepend memory warning if RAM is tight
                     mem_warning, avail_gb = get_memory_warning()
-                    first_msg = resp_data.get("choices", [{}])[0].get("message", {})
-                    orig = first_msg.get("content") or ""
-                    if is_session_start:
-                        first_msg["content"] = make_session_start_notice(avail_gb) + orig
-                    elif mem_warning:
+                    if mem_warning:
+                        first_msg = resp_data.get("choices", [{}])[0].get("message", {})
+                        orig = first_msg.get("content") or ""
                         first_msg["content"] = f"{mem_warning}\n\n{orig}"
                     # Alias rewrite
                     resp_str = json.dumps(resp_data)
