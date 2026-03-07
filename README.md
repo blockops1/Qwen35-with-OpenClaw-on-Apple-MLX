@@ -26,16 +26,34 @@ Built on [vllm-mlx (waybarrios fork)](https://github.com/waybarrios/vllm-mlx) + 
 
 - Apple Silicon Mac (M1 or later)
 - macOS 13+
-- [Homebrew](https://brew.sh) + Python 3.11+ (Homebrew: `brew install python`)
+- Xcode Command Line Tools: `xcode-select --install`
+- [Homebrew](https://brew.sh): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
+- Python 3.11+ via Homebrew: `brew install python`
 - `git-lfs` for model downloads: `brew install git-lfs && git lfs install`
 - Python packages: `aiohttp`, `requests` (installed in steps below)
 - A Qwen3.5 MLX 4-bit model from [mlx-community](https://huggingface.co/mlx-community)
 
-> **Note on `--break-system-packages`:** This flag is for Homebrew Python 3.11+. If you're on a different Python setup, omit it or use a virtual environment.
+> **Note on `--break-system-packages`:** Commands below use this flag for Homebrew Python 3.11+. If you're using pyenv, conda, or a virtual environment, omit the flag.
+
+> **Note on security:** The proxy listens on `0.0.0.0:8080` with no authentication. If your Mac is on a shared or public network, restrict access with a firewall rule (`sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/bin/python3`), or bind to `127.0.0.1` instead if you don't need LAN access.
 
 ---
 
 ## Quick Start
+
+### 0. Prerequisites (one-time)
+
+```bash
+# Xcode Command Line Tools (required for Homebrew)
+xcode-select --install
+
+# Homebrew (if not installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Python 3.11+ and git-lfs
+brew install python git-lfs
+git lfs install
+```
 
 ### 1. Install vllm-mlx
 
@@ -45,20 +63,19 @@ Built on [vllm-mlx (waybarrios fork)](https://github.com/waybarrios/vllm-mlx) + 
 pip3 install git+https://github.com/waybarrios/vllm-mlx.git --break-system-packages
 ```
 
+This installs from source and may take a few minutes.
+
 ### 2. Download a model
 
-> ⚠️ Models are large files stored with Git LFS. Make sure `git lfs install` has been run first, or the clone will download small pointer files instead of actual weights.
+> ⚠️ Models are stored with Git LFS. Without `git lfs install`, `git clone` downloads small pointer files instead of actual weights — the server will fail to load silently.
 
 ```bash
-# One-time setup
-brew install git-lfs && git lfs install
-
 mkdir -p ~/mlx-models && cd ~/mlx-models
 
-# Recommended: Qwen3.5-27B (coding + tool use, ~14GB, needs 32GB+ RAM)
+# Recommended: Qwen3.5-27B (coding + tool use, ~14GB — allow 30-60 min on a typical connection)
 git clone https://huggingface.co/mlx-community/Qwen3.5-27B-4bit
 
-# Lighter option: Qwen3.5-9B-Instruct (fast, tool calling, ~5GB, works on 16GB)
+# Lighter option: Qwen3.5-9B-Instruct (fast, tool calling, ~5GB, works on 16GB RAM)
 git clone https://huggingface.co/mlx-community/Qwen3.5-9B-Instruct-4bit
 ```
 
@@ -96,15 +113,25 @@ vllm-mlx serve command:
 
 ### 4. Configure and start the vllm-mlx server
 
-Edit `scripts/start_vllm.sh` — set your model path and flag:
-
 ```bash
 mkdir -p ~/bin
 cp scripts/start_vllm.sh ~/bin/start_vllm.sh
-# Edit MODEL_PATH and VLLM_FLAG inside the file
 chmod +x ~/bin/start_vllm.sh
+```
+
+Edit `~/bin/start_vllm.sh` — set `MODEL_PATH` and `VLLM_FLAG` to match your model:
+
+```bash
+MODEL_PATH="$HOME/mlx-models/Qwen3.5-9B-Instruct-4bit"   # ← your model path
+VLLM_FLAG="--continuous-batching"                          # ← from detect_flag.py
+```
+
+Then start it:
+```bash
 ~/bin/start_vllm.sh
 ```
+
+You should see vllm-mlx load the model and start listening on port 8091.
 
 ### 5. Configure and start the proxy
 
@@ -113,7 +140,30 @@ pip3 install aiohttp requests --break-system-packages
 
 mkdir -p ~/mlx-server
 cp scripts/proxy.py ~/mlx-server/proxy.py
-# Edit BACKEND, PORT, LOG_FILE, and MODEL_ALIASES at the top of the file
+```
+
+Edit `~/mlx-server/proxy.py` — update the config block at the top:
+
+```python
+BACKEND = "http://127.0.0.1:8091"                 # leave as-is
+PORT = 8080                                        # leave as-is
+LOG_FILE = os.path.expanduser("~/mlx-server/proxy.log")  # leave as-is
+
+MODEL_ALIASES = {
+    "qwen9b": "/Users/yourname/mlx-models/Qwen3.5-9B-Instruct-4bit",  # ← required: update this
+}
+```
+
+> ⚠️ **The `MODEL_ALIASES` entry is required.** If it's missing or the path is wrong, the proxy will fail to route requests. Use the full path, not `~`.
+
+Find your Python path for the launchd step later:
+```bash
+which python3
+# e.g. /opt/homebrew/bin/python3
+```
+
+Start the proxy:
+```bash
 python3 ~/mlx-server/proxy.py
 ```
 
@@ -122,23 +172,79 @@ python3 ~/mlx-server/proxy.py
 ```bash
 # Health check
 curl http://localhost:8080/health
+# → {"status":"healthy",...}
 
 # Run the full test suite
 python3 tests/test_proxy.py --model YOUR-ALIAS
+# → 9/9 passed
 ```
+
+### 7. Manual tool call example
+
+Confirm end-to-end tool calling works with a raw curl:
+
+```bash
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "YOUR-ALIAS",
+    "messages": [{"role": "user", "content": "What files are in /tmp?"}],
+    "max_tokens": 200,
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "list_directory",
+        "description": "List files in a directory.",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }]
+  }' | python3 -m json.tool
+```
+
+Expected response (trimmed):
+```json
+{
+  "choices": [{
+    "finish_reason": "tool_calls",
+    "message": {
+      "tool_calls": [{
+        "function": {
+          "name": "list_directory",
+          "arguments": "{\"path\": \"/tmp\"}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+If you see `"finish_reason": "tool_calls"` and a valid `arguments` JSON string — it's working.
 
 ---
 
 ## Auto-Start with launchd
 
-Copy the plist templates and edit paths:
+Copy the plist templates, then substitute your actual username and Python path:
 
 ```bash
 cp launchd/com.user.vllm-server.plist ~/Library/LaunchAgents/
 cp launchd/com.user.mlx-proxy.plist ~/Library/LaunchAgents/
 
-# Edit both files — replace /Users/yourname with your actual path
+# Substitute your actual username
+sed -i '' "s|/Users/yourname|$HOME|g" ~/Library/LaunchAgents/com.user.vllm-server.plist
+sed -i '' "s|/Users/yourname|$HOME|g" ~/Library/LaunchAgents/com.user.mlx-proxy.plist
 
+# Substitute your actual Python path (from 'which python3')
+PYTHON_PATH=$(which python3)
+sed -i '' "s|/opt/homebrew/bin/python3|$PYTHON_PATH|g" ~/Library/LaunchAgents/com.user.mlx-proxy.plist
+```
+
+Load both services:
+```bash
 launchctl load ~/Library/LaunchAgents/com.user.vllm-server.plist
 launchctl load ~/Library/LaunchAgents/com.user.mlx-proxy.plist
 ```
@@ -147,6 +253,12 @@ Restart services:
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.user.vllm-server
 launchctl kickstart -k gui/$(id -u)/com.user.mlx-proxy
+```
+
+Check logs:
+```bash
+tail -f ~/mlx-server/vllm-server.log
+tail -f ~/mlx-server/proxy.log
 ```
 
 ---
@@ -194,13 +306,13 @@ For OpenClaw agents on a second machine, add a provider:
 
 ```bash
 # Test local stack
-python3 tests/test_proxy.py
+python3 tests/test_proxy.py --model YOUR-ALIAS
 
 # Test remote machine
-python3 tests/test_proxy.py --host 192.168.1.x
+python3 tests/test_proxy.py --host 192.168.1.x --model YOUR-ALIAS
 
-# Test with specific model alias
-python3 tests/test_proxy.py --model qwen9b
+# Test with a different port
+python3 tests/test_proxy.py --port 9090 --model YOUR-ALIAS
 ```
 
 Tests: health check · /v1/models · basic chat · thinking tokens stripped · no spurious tool calls · tool call triggered · tool args valid JSON · correct tool selected (multi-tool) · alias rewrite in response
@@ -216,6 +328,20 @@ CI-friendly: exits 0 on full pass, 1 on any failure.
 
 ### Standard (MacBook, 16GB)
 - Model: `Qwen3.5-9B-Instruct-4bit` · Flag: `--continuous-batching` · Cache: `--cache-memory-percent 0.20`
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Model loads but generates garbage | git-lfs not installed before clone — downloaded pointer files | Re-clone after running `git lfs install` |
+| `vllm-mlx: command not found` | Install landed in non-PATH location | Run `pip3 show vllm-mlx` to find bin dir; add to PATH |
+| `Missing N parameters` on server start | Wrong flag — model has no vision weights but `--mllm` used | Run `detect_flag.py`, use `--continuous-batching` |
+| Proxy starts but all requests 502 | vllm-mlx not running or wrong port | Check port 8091: `curl http://localhost:8091/health` |
+| Tool calls return empty or plain text | `MODEL_ALIASES` path wrong or missing | Check proxy.py config; use absolute path, not `~` |
+| launchd service won't start | Wrong Python path in plist | Run `which python3`, update plist `ProgramArguments` |
+| Port 8080 already in use | Another process on that port | Change `PORT` in proxy.py and PORT in plist |
 
 ---
 
