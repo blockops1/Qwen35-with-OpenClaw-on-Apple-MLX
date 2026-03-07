@@ -35,6 +35,7 @@ Client (OpenClaw agent, curl, your app)
 │                                                     │
 │  • Model alias rewrite  (friendly name → path)      │
 │  • Request size guard (413 if >35k tokens/>300 msg) │
+│  • Concurrency limit (429 if >2 requests in flight) │
 │  • Tool calling:                                    │
 │      - Converts OpenAI tools[] → Qwen-Agent XML     │
 │      - Parses <tool_call> tags → OpenAI format      │
@@ -342,6 +343,22 @@ MAX_MESSAGES    = 300      # runaway session guard
 
 The guard returns HTTP 413 in milliseconds. Tune `MAX_INPUT_TOKENS` and `MAX_MESSAGES` for your use case.
 
+## Concurrency Limit
+
+The proxy also enforces a maximum number of simultaneous in-flight backend requests:
+
+```python
+MAX_CONCURRENT = 2   # max simultaneous requests to vllm-mlx
+```
+
+Requests beyond this limit receive HTTP 429 immediately. This prevents request pile-up from exhausting the KV cache even when individual requests are within the token/message limits.
+
+**Why this matters:** The batched engine allocates KV cache for all concurrent requests simultaneously. Five moderate requests (each 20K tokens) can exhaust 64GB of RAM just as effectively as one 100K-token request. The concurrency limit is the correct protection layer for this.
+
+Log entries: `INFLIGHT_INC`, `INFLIGHT_DEC`, `CONCURRENCY_REJECTED`.
+
+---
+
 **If using OpenClaw**, prevent sessions from reaching the guard in the first place by setting:
 ```json
 "channels": {
@@ -376,6 +393,7 @@ Every request logs structured lines to `proxy.log`:
 Key errors to watch:
 | Log entry | Meaning |
 |-----------|---------|
+| `CONCURRENCY_REJECTED inflight=N limit=N` | Too many concurrent requests — retry in a few seconds |
 | `REQUEST_REJECTED est_tokens=N messages=N` | Request exceeded size guard — session too large, start a new one |
 | `TOOL_BACKEND_NON200 status=504` | Prefill timed out — context too large or timeout too low |
 | `BACKEND_ERROR Server disconnected` | vllm-mlx crashed or wrong flag used (--mllm vs --continuous-batching) |

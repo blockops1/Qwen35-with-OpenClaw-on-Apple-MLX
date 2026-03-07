@@ -39,6 +39,11 @@ ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
 MAX_INPUT_TOKENS = 35000   # estimated from message content (~4 chars/token)
 MAX_MESSAGES    = 300      # runaway session guard
 
+# Concurrency limit — prevent request pile-up from saturating vllm-mlx KV cache
+# Even legitimately-sized requests will OOM the model if too many run at once.
+MAX_CONCURRENT  = 2        # max simultaneous in-flight backend requests
+_inflight       = 0        # current in-flight count (asyncio single-thread safe)
+
 QWEN_TOOL_SYSTEM = """\
 # Tools
 
@@ -348,6 +353,25 @@ async def handle(request: web.Request) -> web.Response:
     tools = data.pop("tools", None)
     data.pop("tool_choice", None)
 
+    # Concurrency guard — reject immediately if too many requests in flight
+    global _inflight
+    if _inflight >= MAX_CONCURRENT:
+        log(f"CONCURRENCY_REJECTED inflight={_inflight} limit={MAX_CONCURRENT} messages={len(messages)}")
+        return web.Response(
+            status=429,
+            content_type="application/json",
+            body=json.dumps({
+                "error": {
+                    "message": (
+                        f"Model busy: {_inflight} requests already in progress "
+                        f"(limit {MAX_CONCURRENT}). Retry in a few seconds."
+                    ),
+                    "type": "rate_limit_exceeded",
+                    "code": 429,
+                }
+            }).encode()
+        )
+
     # Request size guard — fail fast before model hangs
     total_chars_guard = sum(len(m.get("content", "") or "") for m in messages)
     est_tokens_guard  = estimate_tokens(total_chars_guard)
@@ -389,7 +413,13 @@ async def handle(request: web.Request) -> web.Response:
             f"max_tokens={data.get('max_tokens','?')} tools=True")
 
         body_bytes = json.dumps(data).encode()
-        return await handle_tool_stream(request, data, headers, body_bytes)
+        _inflight += 1
+        log(f"INFLIGHT_INC count={_inflight}")
+        try:
+            return await handle_tool_stream(request, data, headers, body_bytes)
+        finally:
+            _inflight -= 1
+            log(f"INFLIGHT_DEC count={_inflight}")
 
     # No tools — regular passthrough (streaming or not, as client requests)
     original_model = data.get("model", "<none>")
@@ -411,6 +441,8 @@ async def handle(request: web.Request) -> web.Response:
     body_bytes = json.dumps(data).encode()
     url = BACKEND + request.path_qs
 
+    _inflight += 1
+    log(f"INFLIGHT_INC count={_inflight}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.request(
@@ -450,6 +482,9 @@ async def handle(request: web.Request) -> web.Response:
     except Exception as e:
         log(f"BACKEND_ERROR {e}")
         return web.Response(status=502, body=json.dumps({"error": str(e)}).encode())
+    finally:
+        _inflight -= 1
+        log(f"INFLIGHT_DEC count={_inflight}")
 
 
 async def main():
