@@ -33,6 +33,12 @@ MODEL_ALIASES = {
 }
 ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
 
+# Request size limits — prevent runaway sessions from hanging vllm-mlx
+# A 42K-token request takes 300s+ to process, causing a timeout that locks
+# the model and kills all concurrent sessions. Fail fast with 413 instead.
+MAX_INPUT_TOKENS = 35000   # estimated from message content (~4 chars/token)
+MAX_MESSAGES    = 300      # runaway session guard
+
 QWEN_TOOL_SYSTEM = """\
 # Tools
 
@@ -341,6 +347,28 @@ async def handle(request: web.Request) -> web.Response:
     messages = data.get("messages", [])
     tools = data.pop("tools", None)
     data.pop("tool_choice", None)
+
+    # Request size guard — fail fast before model hangs
+    total_chars_guard = sum(len(m.get("content", "") or "") for m in messages)
+    est_tokens_guard  = estimate_tokens(total_chars_guard)
+    if est_tokens_guard > MAX_INPUT_TOKENS or len(messages) > MAX_MESSAGES:
+        log(f"REQUEST_REJECTED est_tokens={est_tokens_guard} messages={len(messages)} "
+            f"— exceeds limits (max_tokens={MAX_INPUT_TOKENS} max_messages={MAX_MESSAGES})")
+        return web.Response(
+            status=413,
+            content_type="application/json",
+            body=json.dumps({
+                "error": {
+                    "message": (
+                        f"Request too large: ~{est_tokens_guard} tokens / {len(messages)} messages. "
+                        f"Limits: {MAX_INPUT_TOKENS} tokens, {MAX_MESSAGES} messages. "
+                        "Start a new session."
+                    ),
+                    "type": "request_too_large",
+                    "code": 413,
+                }
+            }).encode()
+        )
 
     if tools:
         tool_system = build_tool_system_prompt(tools)

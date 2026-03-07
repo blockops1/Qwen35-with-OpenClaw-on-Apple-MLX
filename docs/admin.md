@@ -34,6 +34,7 @@ Client (OpenClaw agent, curl, your app)
 │  Async Proxy (proxy_qwen35.py — aiohttp)            │
 │                                                     │
 │  • Model alias rewrite  (friendly name → path)      │
+│  • Request size guard (413 if >35k tokens/>300 msg) │
 │  • Tool calling:                                    │
 │      - Converts OpenAI tools[] → Qwen-Agent XML     │
 │      - Parses <tool_call> tags → OpenAI format      │
@@ -328,6 +329,32 @@ Standard `mlx_lm` does not support tool calling. This stack implements it entire
 
 ---
 
+## Request Size Guard
+
+The proxy rejects oversized requests immediately (HTTP 413) rather than passing them to vllm-mlx:
+
+```python
+MAX_INPUT_TOKENS = 35000   # estimated from message content (~4 chars/token)
+MAX_MESSAGES    = 300      # runaway session guard
+```
+
+**Why this matters:** vllm-mlx processes any request regardless of size. A single oversized request (e.g. a runaway chat session with 500+ messages) can take 300+ seconds, hit the server timeout, and hang the model process — blocking all other concurrent sessions until a restart.
+
+The guard returns HTTP 413 in milliseconds. Tune `MAX_INPUT_TOKENS` and `MAX_MESSAGES` for your use case.
+
+**If using OpenClaw**, prevent sessions from reaching the guard in the first place by setting:
+```json
+"channels": {
+  "telegram": { "historyLimit": 20 }
+},
+"agents": { "defaults": { "compaction": {
+  "maxHistoryShare": 0.4
+}}}
+```
+> ⚠️ `historyLimit: 0` means **unlimited** (not zero) in OpenClaw — a common misconfiguration.
+
+---
+
 ## Why `stream:false` to Backend
 
 The proxy forces `stream:false` when tools are present because `<tool_call>` tags get split across SSE chunks and can't be reliably parsed mid-stream. The client still gets SSE (with heartbeat keepalives) — only the backend-to-proxy leg is non-streaming.
@@ -349,6 +376,7 @@ Every request logs structured lines to `proxy.log`:
 Key errors to watch:
 | Log entry | Meaning |
 |-----------|---------|
+| `REQUEST_REJECTED est_tokens=N messages=N` | Request exceeded size guard — session too large, start a new one |
 | `TOOL_BACKEND_NON200 status=504` | Prefill timed out — context too large or timeout too low |
 | `BACKEND_ERROR Server disconnected` | vllm-mlx crashed or wrong flag used (--mllm vs --continuous-batching) |
 | `WRITE_ERROR heartbeat` | Client closed connection (usually harmless) |
@@ -375,7 +403,9 @@ For OpenClaw agents on another machine, configure a provider pointing to `http:/
 | `Missing N parameters` on startup | Wrong flag — model has no vision weights but `--mllm` used | Check safetensors, use `--continuous-batching` |
 | Port conflict on 8080/8091 | Old process still running | `pkill -f mlx_lm.server` or `pkill -f vllm-mlx` |
 | Tool calls return empty body | Client parsing raw SSE as JSON | Parse `data: {...}` lines from SSE response |
-| 504 timeout on tool calls | Context too large for timeout setting | Increase `--timeout` in config; reduce history |
+| HTTP 413 from proxy | Session exceeded size guard (>35k tokens or >300 messages) | Start a new session; reduce `historyLimit` in your client |
+| 504 timeout on tool calls | Context too large for timeout setting | Reduce session history; set `compaction.maxHistoryShare: 0.4` in OpenClaw |
+| Sessions grow unbounded (OpenClaw) | `historyLimit: 0` means unlimited | Set `historyLimit: 20` in `channels.telegram` |
 | Slow generation with two models | Two models loaded in RAM simultaneously | Only load one model at a time |
 | `BACKEND_ERROR Server disconnected` | vllm-mlx rejecting stream:false request | Usually wrong flag — check --mllm vs --continuous-batching |
 
@@ -401,3 +431,17 @@ For OpenClaw agents on another machine, configure a provider pointing to `http:/
 - Model: Qwen3.5-9B-Instruct-4bit · Flag: `--continuous-batching` · Cache: 20%
 - vllm-mlx: port 8091 · Proxy: port 8080
 - Also configured to use Jill's stack as remote fallback
+
+---
+
+## Known Limitations
+
+### `--max-model-len` is not supported in vllm-mlx
+
+The mainline vLLM flag `--max-model-len` does **not** exist in the vllm-mlx fork. Passing it causes:
+
+```
+vllm-mlx: error: unrecognized arguments: --max-model-len 40000
+```
+
+Use the proxy's `MAX_INPUT_TOKENS` guard instead — it achieves the same protection at the API layer.
