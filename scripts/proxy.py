@@ -495,7 +495,7 @@ async def handle(request: web.Request) -> web.Response:
             "id": model_id,
             "object": "model",
             "created": int(time.time()),
-            "owned_by": "jill-local",
+            "owned_by": "local",
         }
         log(f"MODELS_SYNTHETIC id={model_id} → 200")
         return web.Response(
