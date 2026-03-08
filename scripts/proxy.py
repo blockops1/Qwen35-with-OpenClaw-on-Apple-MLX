@@ -1,14 +1,15 @@
 """
-MLX-VLM Async Proxy for Jill
+MLX-VLM Async Proxy
 - Maps model alias 'qwen35' to local model path
 - Injects Qwen-Agent system prompt for tool calling
 - Parses <tool_call> tags and converts to OpenAI tool_calls format
 - Streams SSE heartbeat chunks during tool requests to keep Telegram socket alive
 Port 8080 → forwards to vllm-mlx on port 8091
 
-Log file: /Users/jill/mlx-server/proxy-qwen35.log
+Log file: ~/mlx-server/proxy-qwen35.log
 """
 import asyncio
+import os
 import json
 import re
 import uuid
@@ -20,22 +21,34 @@ from aiohttp import web
 
 DEFAULT_BACKEND = "http://127.0.0.1:8091"
 PORT = 8080
-LOG_FILE = "/Users/jill/mlx-server/proxy-qwen35.log"
+LOG_FILE = os.path.expanduser("~/mlx-server/proxy-qwen35.log")
 HEARTBEAT_INTERVAL = 5   # seconds between SSE keepalive chunks
-COLD_START_WARN_S  = 60  # seconds before emitting cold-start warning to client
+COLD_START_WARN_S  = 300  # seconds before emitting cold-start warning to client
 
 MODEL_ALIASES = {
-    "qwen35":           "/Users/jill/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",  # active: distilled 2026-03-07
-    "qwen35-base":      "/Users/jill/mlx-models/Qwen3.5-27B-4bit",                                  # inactive: base VLM
+    # Map alias names to full model paths on this machine.
+    # Use absolute paths — ~ is not expanded by vllm-mlx.
+    # Example (update to match your actual model paths):
+    "qwen35":      "/Users/yourname/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
+    "qwen35-base": "/Users/yourname/mlx-models/Qwen3.5-27B-4bit",
 }
 # Per-alias backend override — only needed when running a second server on a different port
 MODEL_BACKENDS = {}
 
 MAX_MESSAGES    = 300      # runaway session guard (belt-and-suspenders)
 
+# Context token guard — prevents Metal OOM crash (confirmed crash at 85,524 actual tokens)
+# Estimate: max(chars/3.0, last_known_actual) — conservative ratio catches dense tool results
+# Last successful: 51,410 tokens (peak Metal 52.5GB). Crash at 85,524. Guard at 70K.
+TOKEN_WARN_THRESHOLD = 60_000   # soft warning — inject visible notice, continue request
+TOKEN_HARD_THRESHOLD = 70_000   # hard stop — return retryable 200 error, block backend
+
+# Token tracking state — updated from RESPONSE usage.prompt_tokens each turn
+_last_actual_prompt_tokens = 0   # last confirmed actual token count from model
+
 # Concurrency limit — prevent request pile-up from saturating vllm-mlx
-MAX_CONCURRENT  = 2        # max simultaneous in-flight backend requests
-# Tune by hardware: 64GB+27B→2, 64GB+9B→4, 32GB+9B→2-3 (429 → Claude fallback)
+MAX_CONCURRENT  = 1        # max simultaneous in-flight backend requests
+# Tune by hardware: 64GB+27B→1 (crashes at 2 with large contexts), 64GB+9B→3-4
 _inflight       = 0        # current count (guarded by asyncio single-thread)
 
 # Memory warning thresholds — warnings only, no enforcement (testing mode)
@@ -129,8 +142,49 @@ def get_memory_warning() -> tuple[str | None, float]:
         return None, 0.0
 
 
+# Track session state for cache estimation
+_last_prompt_tokens = 0
+_is_new_session = True
+
+
+def estimate_actual_tokens(messages: list) -> int:
+    """
+    Estimate actual prompt_tokens for this request.
+    Uses max(chars/3.0, last_known_actual) — empirically validated ratio:
+      - Normal messages: ~3.0 chars/token
+      - Dense tool results (code/JSON): ~2.5 chars/token (crash case was 2.48)
+    Taking max with last known actual ensures we never underestimate a growing session.
+    """
+    total_chars = sum(len(m.get("content", "") or "") for m in messages)
+    char_estimate = int(total_chars / 3.0)
+    return max(char_estimate, _last_actual_prompt_tokens)
+
+
+def estimate_cache_tokens(prompt_tokens: int) -> tuple[int, int]:
+    """
+    Estimate cache_read and cache_write tokens.
+    New session: all prompt tokens are cache writes (building cache)
+    Continuation: all prompt tokens are cache reads (using cache)
+    Returns (cache_read_tokens, cache_write_tokens)
+    """
+    global _is_new_session, _last_prompt_tokens
+    
+    if _is_new_session:
+        # New session — building the cache
+        cache_write = prompt_tokens
+        cache_read = 0
+        _is_new_session = False
+    else:
+        # Continuation — reading from cache
+        cache_read = prompt_tokens
+        cache_write = 0
+    
+    _last_prompt_tokens = prompt_tokens
+    return cache_read, cache_write
+
+
 def estimate_tokens(char_count):
-    return char_count // 4
+    return char_count // 4  # legacy — used only for log display
 
 
 def build_tool_system_prompt(tools: list) -> str:
@@ -237,6 +291,32 @@ async def fetch_backend_blocking(body_bytes: bytes, headers: dict, path_qs: str,
         return json.dumps({"error": str(e)}).encode(), 502
 
 
+def make_context_limit_sse(request_id: str, model: str, est_tokens: int, threshold: int) -> bytes:
+    """Return a complete SSE stream signalling context limit — 200 OK, user-visible, retryable."""
+    content = (
+        f"⚠️ **Context limit reached** (~{est_tokens // 1000}k tokens, limit {threshold // 1000}k). "
+        f"Run `/compact` to reduce the session context, then retry your request."
+    )
+    chunk = make_sse_chunk(request_id, model, {"role": "assistant", "content": content}, "stop")
+    return chunk + b"data: [DONE]\n\n"
+
+
+def make_context_limit_json(request_id: str, model: str, est_tokens: int, threshold: int) -> bytes:
+    """Return a JSON chat completion signalling context limit — 200 OK, user-visible, retryable."""
+    content = (
+        f"⚠️ **Context limit reached** (~{est_tokens // 1000}k tokens, limit {threshold // 1000}k). "
+        f"Run `/compact` to reduce the session context, then retry your request."
+    )
+    return json.dumps({
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": est_tokens, "completion_tokens": 0, "total_tokens": est_tokens},
+    }).encode()
+
+
 def make_sse_chunk(request_id, model, delta, finish_reason=None):
     chunk = {
         "id": request_id,
@@ -258,7 +338,8 @@ async def safe_write(response: web.StreamResponse, data: bytes, label: str = "")
         return False
 
 
-async def handle_tool_stream(request: web.Request, data: dict, headers: dict, body_bytes: bytes, session_start: bool = False):
+async def handle_tool_stream(request: web.Request, data: dict, headers: dict, body_bytes: bytes,
+                             session_start: bool = False, context_warning: str | None = None):
     """
     Tool-call path:
     1. Open SSE stream to client immediately
@@ -279,6 +360,11 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
         },
     )
     await response.prepare(request)
+
+    # Context token soft warning — emitted before real response if approaching limit
+    if context_warning:
+        warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": context_warning})
+        await safe_write(response, warn_chunk, "ctx-warn")
 
     # Memory warning — emit as SSE chunk if RAM is tight (per-turn, short message)
     mem_warning, avail_gb = get_memory_warning()
@@ -310,7 +396,7 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
                     warning_text = (
                         "⏳ *Cold start detected* — initial prefill in progress. "
                         "This can take up to 5 minutes on the first request. "
-                        "Subsequent responses in this session will be much faster."
+                        "Subsequent responses in this session will be much faster.\n\n"
                     )
                     warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": warning_text})
                     await safe_write(response, warn_chunk, "cold-start-warn")
@@ -334,6 +420,9 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
         usage = resp_data.get("usage", {})
         if usage:
             log(f"RESPONSE usage={usage}")
+            # Update actual token tracker — used by estimate_actual_tokens() on next request
+            global _last_actual_prompt_tokens
+            _last_actual_prompt_tokens = usage.get("prompt_tokens", _last_actual_prompt_tokens)
 
         # Alias rewrite in response
         resp_str = json.dumps(resp_data)
@@ -481,6 +570,8 @@ async def handle(request: web.Request) -> web.Response:
     user_msgs = [m for m in messages if m.get("role") == "user"]
     is_session_start = len(user_msgs) == 1
     if is_session_start:
+        # Reset cache estimation state for new session
+        _is_new_session = True
         _, avail_gb = get_memory_warning()
         notice = make_session_start_notice(avail_gb)
         messages = inject_system_notice(messages, notice)
@@ -496,7 +587,7 @@ async def handle(request: web.Request) -> web.Response:
             data["model"] = MODEL_ALIASES[data["model"]]
 
         total_chars = sum(len(m.get("content", "") or "") for m in messages)
-        est_tokens = estimate_tokens(total_chars)
+        est_tokens = estimate_actual_tokens(messages)
         roles = [m.get("role", "?") for m in messages]
         role_summary = ", ".join(f"{r}:{roles.count(r)}" for r in dict.fromkeys(roles))
         log(f"TOOLS_INJECTED count={len(tools)} stream=sse-heartbeat model_req={data.get('model','?')}")
@@ -504,11 +595,35 @@ async def handle(request: web.Request) -> web.Response:
             f"chars={total_chars} est_tokens~{est_tokens} "
             f"max_tokens={data.get('max_tokens','?')} tools=True")
 
+        # Context token guard — hard stop before Metal OOM (crash confirmed at 85,524 tokens)
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        model_alias = data.get("model", "qwen35")
+        if est_tokens >= TOKEN_HARD_THRESHOLD:
+            log(f"CTX_HARD_STOP est_tokens={est_tokens} threshold={TOKEN_HARD_THRESHOLD} — returning user error")
+            response = web.StreamResponse(status=200, headers={
+                "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                "Connection": "keep-alive", "X-Accel-Buffering": "no",
+            })
+            await response.prepare(request)
+            await safe_write(response, make_context_limit_sse(request_id, model_alias, est_tokens, TOKEN_HARD_THRESHOLD), "ctx-hard-stop")
+            return response
+
+        context_warning = None
+        if est_tokens >= TOKEN_WARN_THRESHOLD:
+            context_warning = (
+                f"⚠️ *Context warning* — ~{est_tokens // 1000}k tokens "
+                f"(approaching {TOKEN_HARD_THRESHOLD // 1000}k limit). "
+                f"Consider running `/compact` soon.\n\n"
+            )
+            log(f"CTX_SOFT_WARN est_tokens={est_tokens} threshold={TOKEN_WARN_THRESHOLD}")
+
         body_bytes = json.dumps(data).encode()
         _inflight += 1
         log(f"INFLIGHT_INC count={_inflight}")
         try:
-            return await handle_tool_stream(request, data, headers, body_bytes, session_start=is_session_start)
+            return await handle_tool_stream(request, data, headers, body_bytes,
+                                            session_start=is_session_start,
+                                            context_warning=context_warning)
         finally:
             _inflight -= 1
             log(f"INFLIGHT_DEC count={_inflight}")
@@ -521,14 +636,37 @@ async def handle(request: web.Request) -> web.Response:
     elif data.get("model") not in MODEL_ALIASES.values():
         log(f"MODEL_UNKNOWN model={original_model} — passing through as-is")
     data["enable_thinking"] = False
+    
+    # Track original message count for usage estimation
+    original_message_count = len(messages)
 
     total_chars = sum(len(m.get("content", "") or "") for m in messages)
-    est_tokens = estimate_tokens(total_chars)
+    est_tokens = estimate_actual_tokens(messages)
     roles = [m.get("role", "?") for m in messages]
     role_summary = ", ".join(f"{r}:{roles.count(r)}" for r in dict.fromkeys(roles))
     log(f"REQUEST messages={len(messages)} roles=[{role_summary}] "
         f"chars={total_chars} est_tokens~{est_tokens} "
         f"max_tokens={data.get('max_tokens','?')} tools=False")
+
+    # Context token guard (no-tools path)
+    req_id_nt = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    model_nt = data.get("model", "qwen35")
+    if est_tokens >= TOKEN_HARD_THRESHOLD:
+        log(f"CTX_HARD_STOP est_tokens={est_tokens} threshold={TOKEN_HARD_THRESHOLD} — returning user error")
+        return web.Response(
+            status=200,
+            content_type="application/json",
+            body=make_context_limit_json(req_id_nt, model_nt, est_tokens, TOKEN_HARD_THRESHOLD),
+        )
+
+    ctx_warn_text = None
+    if est_tokens >= TOKEN_WARN_THRESHOLD:
+        ctx_warn_text = (
+            f"⚠️ *Context warning* — ~{est_tokens // 1000}k tokens "
+            f"(approaching {TOKEN_HARD_THRESHOLD // 1000}k limit). "
+            f"Consider running `/compact` soon.\n\n"
+        )
+        log(f"CTX_SOFT_WARN est_tokens={est_tokens} threshold={TOKEN_WARN_THRESHOLD}")
 
     body_bytes = json.dumps(data).encode()
     backend = MODEL_BACKENDS.get(original_model, DEFAULT_BACKEND)
@@ -551,17 +689,37 @@ async def handle(request: web.Request) -> web.Response:
                     usage = resp_data.get("usage", {})
                     if usage:
                         log(f"RESPONSE usage={usage}")
+                        global _last_actual_prompt_tokens
+                        _last_actual_prompt_tokens = usage.get("prompt_tokens", _last_actual_prompt_tokens)
+                    else:
+                        # vllm-mlx not returning usage — estimate it
+                        est_prompt = estimate_actual_tokens(messages)
+                        est_completion = len(str(resp_data.get("choices", [{}])[0].get("message", {}).get("content", ""))) // 4
+                        est_cache_read, est_cache_write = estimate_cache_tokens(est_prompt)
+                        resp_data["usage"] = {
+                            "prompt_tokens": est_prompt,
+                            "completion_tokens": est_completion,
+                            "total_tokens": est_prompt + est_completion,
+                            "cache_read_tokens": est_cache_read,
+                            "cache_write_tokens": est_cache_write
+                        }
+                        log(f"USAGE_ESTIMATED prompt={est_prompt} completion={est_completion} cache_read={est_cache_read} cache_write={est_cache_write} total={est_prompt + est_completion}")
                     # Strip thinking tokens from non-tool responses
                     for choice in resp_data.get("choices", []):
                         msg = choice.get("message", {})
                         if msg.get("content"):
                             msg["content"] = strip_thinking(msg["content"])
-                    # Prepend memory warning if RAM is tight
+                    # Prepend context warning + memory warning if applicable
+                    first_msg = resp_data.get("choices", [{}])[0].get("message", {})
+                    orig = first_msg.get("content") or ""
+                    prefix = ""
+                    if ctx_warn_text:
+                        prefix += ctx_warn_text
                     mem_warning, avail_gb = get_memory_warning()
                     if mem_warning:
-                        first_msg = resp_data.get("choices", [{}])[0].get("message", {})
-                        orig = first_msg.get("content") or ""
-                        first_msg["content"] = f"{mem_warning}\n\n{orig}"
+                        prefix += f"{mem_warning}\n\n"
+                    if prefix:
+                        first_msg["content"] = prefix + orig
                     # Alias rewrite
                     resp_str = json.dumps(resp_data)
                     for path, alias in ALIAS_REVERSE.items():
