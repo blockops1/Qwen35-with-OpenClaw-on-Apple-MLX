@@ -351,14 +351,14 @@ The most important settings for stable long-running sessions:
 ```json
 {
   "agents": {
-    "settings": {
+    "defaults": {
       "contextWindow": 85000,
       "compaction": {
         "mode": "safeguard",
         "reserveTokensFloor": 20000,
         "memoryFlush": {
           "enabled": true,
-          "softThresholdTokens": 65000
+          "softThresholdTokens": 20000
         }
       },
       "timeoutSeconds": 600
@@ -372,11 +372,11 @@ The most important settings for stable long-running sessions:
 | Setting | Recommended | Why |
 |---------|-------------|-----|
 | `contextWindow` | `85000` | Matches actual crash boundary on 64GB. Do not set higher. |
-| `reserveTokensFloor` | `20000` | Ensures compaction triggers before the proxy's 60K soft warning |
-| `softThresholdTokens` | `65000` | Compaction kicks in here — keeps sessions well below the 70K hard stop |
+| `reserveTokensFloor` | `20000` | Hard floor — compaction is forced when fewer than 20K tokens remain in context |
+| `softThresholdTokens` | `20000` | Compaction triggers once the session hits 20K tokens — fires early, keeps sessions lean |
 | `timeoutSeconds` | `600` | 27B cold-start prefill can take 5–10 min on first request; shorter timeout causes false failures |
 
-> **Important:** If `softThresholdTokens` is set too high (e.g., 80K+), OpenClaw may not compact before the proxy's hard stop at 70K, resulting in user-visible error messages instead of smooth compaction.
+> **Note on `softThresholdTokens`:** 20K is intentionally aggressive. Local models have no token cost, so compacting frequently is free and keeps sessions responsive. If you prefer longer uninterrupted sessions (at the risk of approaching the 70K hard stop), you can raise this to 40K–50K.
 
 ### For a 16GB machine (9B model)
 
@@ -472,6 +472,8 @@ vllm-mlx serve ~/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit \
   --tool-call-parser hermes \
   --enable-auto-tool-choice \
   --cache-memory-percent 0.30 \
+  --kv-cache-quantization \
+  --kv-cache-quantization-bits 8 \
   --chunked-prefill-tokens 1024 \
   --timeout 600
 ```
