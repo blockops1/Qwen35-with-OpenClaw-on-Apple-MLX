@@ -310,7 +310,7 @@ This section covers recommended `openclaw.json` settings for running a local Qwe
 
 ### Provider configuration
 
-Add your local proxy as a custom provider:
+Add your local proxy as a custom provider. The `contextWindow` and `maxTokens` are set **on the model definition** — this is where OpenClaw reads them:
 
 ```json
 {
@@ -338,30 +338,29 @@ Add your local proxy as a custom provider:
 }
 ```
 
-For a **remote machine on your LAN** (e.g., using this Mac as a backend for an agent on another machine):
+For a **remote machine on your LAN** (e.g., a second agent using this Mac as its model backend), change `baseUrl` to the host machine's LAN IP:
 
 ```json
 "baseUrl": "http://192.168.1.x:8080/v1"
 ```
 
-### Context window and compaction settings
+Everything else stays the same — the remote agent doesn't need to know anything about vllm-mlx internals.
 
-The most important settings for stable long-running sessions:
+### Compaction and timeout settings
 
 ```json
 {
   "agents": {
     "defaults": {
-      "contextWindow": 85000,
+      "timeoutSeconds": 600,
       "compaction": {
         "mode": "safeguard",
         "reserveTokensFloor": 20000,
         "memoryFlush": {
           "enabled": true,
-          "softThresholdTokens": 20000
+          "softThresholdTokens": 4000
         }
-      },
-      "timeoutSeconds": 600
+      }
     }
   }
 }
@@ -369,27 +368,46 @@ The most important settings for stable long-running sessions:
 
 **Key values explained:**
 
-| Setting | Recommended | Why |
-|---------|-------------|-----|
-| `contextWindow` | `85000` | Matches actual crash boundary on 64GB. Do not set higher. |
-| `reserveTokensFloor` | `20000` | Hard floor — compaction is forced when fewer than 20K tokens remain in context |
-| `softThresholdTokens` | `20000` | Compaction triggers once the session hits 20K tokens — fires early, keeps sessions lean |
+| Setting | Value | Why |
+|---------|-------|-----|
+| `contextWindow` | `85000` | Set on the **model definition** (see above). Matches confirmed crash boundary on 64GB. |
+| `maxTokens` | `16384` | Maximum completion tokens per response. |
+| `reserveTokensFloor` | `20000` | Hard floor — forces compaction when fewer than 20K tokens remain |
+| `softThresholdTokens` | `4000` | Compaction memory-flush runs once context exceeds 4K tokens — intentionally aggressive for local models (no cost, keeps sessions lean) |
 | `timeoutSeconds` | `600` | 27B cold-start prefill can take 5–10 min on first request; shorter timeout causes false failures |
-
-> **Note on `softThresholdTokens`:** 20K is intentionally aggressive. Local models have no token cost, so compacting frequently is free and keeps sessions responsive. If you prefer longer uninterrupted sessions (at the risk of approaching the 70K hard stop), you can raise this to 40K–50K.
 
 ### For a 16GB machine (9B model)
 
 ```json
 {
-  "contextWindow": 32000,
-  "compaction": {
-    "reserveTokensFloor": 8000,
-    "memoryFlush": {
-      "softThresholdTokens": 24000
+  "models": {
+    "providers": {
+      "my-local": {
+        "baseUrl": "http://localhost:8080/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [{
+          "id": "qwen9b",
+          "name": "Qwen 3.5 9B (local)",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        }]
+      }
     }
   },
-  "timeoutSeconds": 120
+  "agents": {
+    "defaults": {
+      "timeoutSeconds": 120,
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokensFloor": 8000,
+        "memoryFlush": { "enabled": true, "softThresholdTokens": 4000 }
+      }
+    }
+  }
 }
 ```
 
