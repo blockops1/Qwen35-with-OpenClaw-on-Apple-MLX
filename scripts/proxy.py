@@ -22,13 +22,20 @@ from aiohttp import web
 DEFAULT_BACKEND = "http://127.0.0.1:8091"
 PORT = 8080
 LOG_FILE = os.path.expanduser("~/mlx-server/proxy-qwen35.log")
+
+# Active model identity — set via MODEL_NAME env var in launchd plist
+# "distilled" → Qwen3.5 Claude Distilled  |  "instruct" → Qwen3.5 Base Instruct
+_MODEL_NAME = os.environ.get("MODEL_NAME", "distilled")
+_MODEL_DISPLAY = {
+    "distilled": "Qwen3.5 Claude Distilled (conversational)",
+    "instruct":  "Qwen3.5 Base Instruct (software development)",
+}.get(_MODEL_NAME, f"Qwen3.5 ({_MODEL_NAME})")
 HEARTBEAT_INTERVAL = 5   # seconds between SSE keepalive chunks
 COLD_START_WARN_S  = 300  # seconds before emitting cold-start warning to client
 
 MODEL_ALIASES = {
     # Map alias names to full model paths on this machine.
     # Use absolute paths — ~ is not expanded by vllm-mlx.
-    # Example (update to match your actual model paths):
     "qwen35":      "/Users/yourname/mlx-models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
     "qwen35-base": "/Users/yourname/mlx-models/Qwen3.5-27B-4bit",
 }
@@ -45,6 +52,8 @@ TOKEN_HARD_THRESHOLD = 70_000   # hard stop — return retryable 200 error, bloc
 
 # Token tracking state — updated from RESPONSE usage.prompt_tokens each turn
 _last_actual_prompt_tokens = 0   # last confirmed actual token count from model
+_banner_sent       = False   # True after model banner emitted; resets when msg count drops (= /new)
+_last_message_count = 0      # tracks message count monotonic growth within a session
 
 # Concurrency limit — prevent request pile-up from saturating vllm-mlx
 MAX_CONCURRENT  = 1        # max simultaneous in-flight backend requests
@@ -361,6 +370,11 @@ async def handle_tool_stream(request: web.Request, data: dict, headers: dict, bo
     )
     await response.prepare(request)
 
+    # Session start — emit model identity banner as first visible SSE chunk
+    if session_start:
+        banner = f"🧠 *Active model: {_MODEL_DISPLAY}*\n\n"
+        await safe_write(response, make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": banner}), "model-banner")
+
     # Context token soft warning — emitted before real response if approaching limit
     if context_warning:
         warn_chunk = make_sse_chunk(request_id, model_alias, {"role": "assistant", "content": context_warning})
@@ -567,8 +581,19 @@ async def handle(request: web.Request) -> web.Response:
         )
 
     # Session start detection — first user message (system + 1 user msg = new session)
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    is_session_start = len(user_msgs) == 1
+    user_msgs     = [m for m in messages if m.get("role") == "user"]
+    # Session start detection via message count.
+    # Within a session, message count grows monotonically.
+    # After /new, it drops — that drop is the reliable "new session" signal.
+    global _banner_sent, _last_message_count
+    current_msg_count = len(messages)
+    if current_msg_count < _last_message_count:
+        _banner_sent = False  # message count dropped = /new was issued
+        log(f"SESSION_RESET detected (msgs {_last_message_count}→{current_msg_count})")
+    _last_message_count = current_msg_count
+    is_session_start = not _banner_sent and len(user_msgs) == 1
+    if is_session_start:
+        _banner_sent = True
     if is_session_start:
         # Reset cache estimation state for new session
         _is_new_session = True
@@ -709,10 +734,12 @@ async def handle(request: web.Request) -> web.Response:
                         msg = choice.get("message", {})
                         if msg.get("content"):
                             msg["content"] = strip_thinking(msg["content"])
-                    # Prepend context warning + memory warning if applicable
+                    # Prepend model banner (session start) + context warning + memory warning
                     first_msg = resp_data.get("choices", [{}])[0].get("message", {})
                     orig = first_msg.get("content") or ""
                     prefix = ""
+                    if is_session_start:
+                        prefix += f"🧠 *Active model: {_MODEL_DISPLAY}*\n\n"
                     if ctx_warn_text:
                         prefix += ctx_warn_text
                     mem_warning, avail_gb = get_memory_warning()

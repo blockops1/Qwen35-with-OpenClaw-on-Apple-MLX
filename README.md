@@ -23,6 +23,31 @@ Built on [vllm-mlx (waybarrios fork)](https://github.com/waybarrios/vllm-mlx) + 
 
 ---
 
+## What's New in v1.6
+
+### Model switching
+
+Run two models side-by-side and switch between them with one command:
+
+```bash
+~/bin/switch-model.sh distilled    # Qwen3.5 Claude Distilled — conversational, reasoning
+~/bin/switch-model.sh instruct     # Qwen3.5 Base Instruct — code generation, software dev
+```
+
+- Stops current vllm-mlx + proxy pair, loads the new pair (~10 seconds)
+- Session start banner announces active model over Telegram: `🧠 *Active model: Qwen3.5 Claude Distilled (conversational)*`
+- Two dedicated launchd plists per model — launchd can never accidentally start a second process
+- `scripts/switch-model.sh`, `scripts/start-vllm-distilled.sh`, `scripts/start-vllm-instruct.sh` added
+
+### Session start model announcement
+
+Every new `/new` session now opens with a visible model identity banner:
+> 🧠 *Active model: Qwen3.5 Claude Distilled (conversational)*
+
+Set via `MODEL_NAME` env var in the launchd plist — no proxy code changes needed when switching.
+
+---
+
 ## What's New in v1.5
 
 ### Proxy improvements (battle-tested in production)
@@ -433,6 +458,57 @@ Everything else stays the same — the remote agent doesn't need to know anythin
 
 ---
 
+## Model Switching
+
+Two Qwen3.5 27B models are available — only one runs at a time (memory constraint on 64GB):
+
+| Model | Use for | Flag |
+|-------|---------|------|
+| Qwen3.5 Claude Distilled | Conversational, reasoning, general agent work | `--continuous-batching` |
+| Qwen3.5 Base Instruct | Code generation, software development | `--mllm` |
+
+### Setup
+
+Copy the two start scripts and configure your model paths:
+
+```bash
+cp scripts/start-vllm-distilled.sh ~/bin/
+cp scripts/start-vllm-instruct.sh ~/bin/
+chmod +x ~/bin/start-vllm-*.sh
+
+# Edit both scripts — update MODEL_PATH to your actual model directories
+```
+
+Copy the launchd plists (one pair per model):
+
+```bash
+cp launchd/com.user.vllm-distilled.plist ~/Library/LaunchAgents/
+cp launchd/com.user.vllm-instruct.plist ~/Library/LaunchAgents/
+cp launchd/com.user.proxy-distilled.plist ~/Library/LaunchAgents/
+cp launchd/com.user.proxy-instruct.plist ~/Library/LaunchAgents/
+
+sed -i '' "s|/Users/yourname|$HOME|g" ~/Library/LaunchAgents/com.user.vllm-{distilled,instruct}.plist
+sed -i '' "s|/Users/yourname|$HOME|g" ~/Library/LaunchAgents/com.user.proxy-{distilled,instruct}.plist
+```
+
+Copy the switch script:
+
+```bash
+cp scripts/switch-model.sh ~/bin/
+chmod +x ~/bin/switch-model.sh
+```
+
+### Switching models
+
+```bash
+~/bin/switch-model.sh distilled
+~/bin/switch-model.sh instruct
+```
+
+The switch takes ~10 seconds. vllm-mlx then loads the new model (2–5 min). Start a `/new` session when ready — the banner confirms which model is active.
+
+---
+
 ## Multi-Machine Setup
 
 The proxy binds to `0.0.0.0:8080` by default. Any machine on your LAN can use it:
@@ -542,11 +618,16 @@ vllm-mlx serve ~/mlx-models/Qwen3.5-9B-Instruct-4bit \
 
 | File | Purpose |
 |------|---------|
-| `scripts/proxy.py` | Async proxy — tool calling, SSE heartbeat, token guard, alias rewriting |
-| `scripts/start_vllm.sh` | vllm-mlx startup script template |
+| `scripts/proxy.py` | Async proxy — tool calling, SSE heartbeat, token guard, model banner |
+| `scripts/switch-model.sh` | Switch between distilled and instruct models |
+| `scripts/start-vllm-distilled.sh` | vllm-mlx start script — Claude Distilled model |
+| `scripts/start-vllm-instruct.sh` | vllm-mlx start script — Base Instruct model |
+| `scripts/start_vllm.sh` | Generic vllm-mlx startup template (single-model setup) |
 | `scripts/detect_flag.py` | Detect correct vllm-mlx flag for any model |
-| `launchd/com.user.vllm-server.plist` | launchd template for vllm-mlx |
-| `launchd/com.user.mlx-proxy.plist` | launchd template for proxy |
+| `launchd/com.user.vllm-distilled.plist` | launchd plist — distilled vllm-mlx |
+| `launchd/com.user.vllm-instruct.plist` | launchd plist — instruct vllm-mlx |
+| `launchd/com.user.proxy-distilled.plist` | launchd plist — proxy for distilled model |
+| `launchd/com.user.proxy-instruct.plist` | launchd plist — proxy for instruct model |
 | `tests/test_proxy.py` | Full test suite (9 tests) |
 | `docs/admin.md` | Detailed admin guide |
 

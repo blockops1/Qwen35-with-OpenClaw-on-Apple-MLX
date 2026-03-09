@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.6 (2026-03-09)
+
+### Model switching
+- `scripts/switch-model.sh` — switch between distilled and instruct with one command
+- `scripts/start-vllm-distilled.sh` — dedicated start script for Claude Distilled model
+- `scripts/start-vllm-instruct.sh` — dedicated start script for Base Instruct model
+- Four launchd plists (two per model) — only one pair loads at a time, no double-process risk
+- `MODEL_NAME` env var in proxy plist — proxy reads it at startup, no code changes needed to switch
+
+### Session start model announcement
+- Every `/new` session opens with: `🧠 *Active model: Qwen3.5 Claude Distilled (conversational)*`
+- Banner fires exactly once per session via message-count drop detection (`/new` resets context)
+- Proxy: `_banner_sent` global flag, resets when incoming message count drops (reliable `/new` signal)
+
+### Proxy fixes
+- Session start detection: was firing on every tool round-trip (user_msgs==1 check too broad)
+- Final fix: `_banner_sent` flag + message count monotonicity — robust across all OpenClaw startup patterns
+
+---
+
 ## v1.5 (2026-03-08)
 
 ### Proxy improvements
