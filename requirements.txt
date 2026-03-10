@@ -1,0 +1,14 @@
+# Python dependencies for proxy.py
+# Install with: pip3 install -r requirements.txt --break-system-packages
+#
+# Note: transformers must be >= 5.3.0 for Qwen3.5 architecture support.
+# The PyPI release (4.x) does not recognize qwen3_5 — install from HuggingFace main:
+#   pip3 install git+https://github.com/huggingface/transformers.git --break-system-packages
+#
+# vllm-mlx: use the waybarrios fork, NOT the PyPI version (tool calls are broken on PyPI):
+#   pip3 install git+https://github.com/waybarrios/vllm-mlx.git --break-system-packages
+
+aiohttp>=3.13.0
+psutil>=5.9.0
+mlx-lm>=0.30.0
+huggingface_hub>=1.5.0

@@ -10,7 +10,7 @@ Usage:
     python3 test_proxy.py
 
     # Test remote machine
-    python3 test_proxy.py --host 192.168.1.x
+    python3 test_proxy.py --host <other-mac-ip>
 
     # Test with a different model alias
     python3 test_proxy.py --model qwen9b

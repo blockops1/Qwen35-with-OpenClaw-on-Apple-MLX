@@ -1,55 +1,55 @@
 # Changelog
 
-## v1.6 (2026-03-09)
+## v2.0 (2026-03-10)
 
-### Model switching
-- `scripts/switch-model.sh` — switch between distilled and instruct with one command
-- `scripts/start-vllm-distilled.sh` — dedicated start script for Claude Distilled model
-- `scripts/start-vllm-instruct.sh` — dedicated start script for Base Instruct model
-- Four launchd plists (two per model) — only one pair loads at a time, no double-process risk
-- `MODEL_NAME` env var in proxy plist — proxy reads it at startup, no code changes needed to switch
+Major update — production-validated stack with LCM integration and proxy token tracking fix.
 
-### Session start model announcement
-- Every `/new` session opens with: `🧠 *Active model: Qwen3.5 Claude Distilled (conversational)*`
-- Banner fires exactly once per session via message-count drop detection (`/new` resets context)
-- Proxy: `_banner_sent` global flag, resets when incoming message count drops (reliable `/new` signal)
+### Proxy (`proxy.py`)
+- **Token tracking fix:** Proxy now emits a trailing SSE `usage` chunk after every tool-call response, including the actual `prompt_tokens` count from vllm-mlx. Without this, the context manager sees a ~10K token undercount (because the proxy injects Qwen-Agent XML system prompts for tool calling that aren't visible to OpenClaw). Symptom was LCM compacting too late → Metal OOM.
+- **SSE heartbeat:** Empty SSE chunks every 5 seconds during long prefills — prevents Telegram/client socket timeouts on responses > 60s.
+- **Metal OOM guard:** Soft warning and hard stop (with user-visible retryable error) before the crash zone. Measured crash at 85,524 actual tokens on 64GB.
+- **Accurate token estimation:** Uses `max(chars/3.0, last_known_actual)` — validated against dense tool/JSON content. Updates from `usage.prompt_tokens` each turn.
+- **Session start banner:** Every new session announces the active model once.
+- **Synthetic `/v1/models/{id}` endpoint:** OpenClaw compatibility (vllm-mlx doesn't expose per-model detail endpoints).
 
-### Proxy fixes
-- Session start detection: was firing on every tool round-trip (user_msgs==1 check too broad)
-- Final fix: `_banner_sent` flag + message count monotonicity — robust across all OpenClaw startup patterns
+### Documentation
+- `docs/PREREQUISITES.md` — hardware requirements, git-lfs warning, Python/vllm-mlx install, model download, Telegram bot setup, multi-machine networking
+- `docs/SETUP.md` — complete setup guide from scratch
+- `docs/LCM.md` — Lossless Context Management integration: why it matters for local models, config, token tracking detail, tuning reference
+- `docs/openclaw-config-snippets.md` — four annotated config snippets: plugin slot, local model provider, primary/fallback model, LCM env vars
+- `requirements.txt` — pinned Python dependencies
+
+### vllm-mlx Reference Config
+- `--kv-cache-quantization --kv-cache-quantization-bits 8` — reduces KV cache memory
+- `--chunked-prefill-tokens 1024` — halves peak Metal activation memory during prefill
+- `--timeout 600` — for long 27B prefills
+- `--cache-memory-percent 0.30` — explicit KV cache allocation
+
+### Scripts
+- `scripts/switch-model.sh` — switch between model variants (distilled / instruct) with one command; handles launchd unload/load of both vllm and proxy pairs
+- `scripts/start-vllm.sh` — updated with full production flags
+- `scripts/start-proxy.sh` — proxy startup wrapper
+
+### launchd
+- Simplified to one vllm plist + one proxy plist (generic names)
+- `RunAtLoad=true` + `KeepAlive=true` — auto-restart on crash
 
 ---
+
+## v1.6 (2026-03-09)
+
+- `scripts/switch-model.sh` — switch between distilled and instruct with one command
+- `scripts/start-vllm-distilled.sh` / `start-vllm-instruct.sh` — dedicated start scripts per model
+- Four launchd plists (two per model)
+- Session start model announcement banner
 
 ## v1.5 (2026-03-08)
 
-### Proxy improvements
-- **Context token guard** — soft warning at 60K tokens, hard stop at 70K with retryable user message (prevents silent Metal GPU OOM crash confirmed at ~85K tokens on 64GB)
-- **Accurate token estimation** — `max(chars/3.0, last_known_actual)` replaces `chars/4`; validated against dense tool/JSON content
-- **Actual token tracking** — updates from `usage.prompt_tokens` each turn for progressively better estimates
-- **Concurrency** — `MAX_CONCURRENT` defaults to 1 for 27B on 64GB (2 concurrent requests triggers OOM at high token counts)
-- **Cold-start warning** — visible SSE message to client after 5 minutes of prefill
-- **Synthetic `/v1/models/{id}` endpoint** — OpenClaw compatibility (vllm-mlx doesn't have this endpoint)
-- **Separate log file** — `proxy-qwen35.log` (not `proxy.log`)
-- **Backend timeout** — increased to 700s for long 27B prefills
-
-### vllm-mlx reference config
-- Added `--kv-cache-quantization` + `--kv-cache-quantization-bits 8` (reduces KV cache memory, recommended for 27B)
-- Added `--chunked-prefill-tokens 1024` (halves peak Metal activation memory during prefill)
-- Added `--timeout 600`
-
-### OpenClaw configuration guide (new)
-- Provider config template with correct key placement (`contextWindow` on model definition)
-- Compaction settings verified against two working production machines:
-  - `contextWindow: 85000`, `maxTokens: 16384`
-  - `reserveTokensFloor: 20000`, `softThresholdTokens: 4000`
-  - `timeoutSeconds: 600`
-- 16GB / 9B config variant included
-- Remote LAN agent setup documented
-
-### Cleanup
-- Removed stale duplicate files (`proxy_qwen35.py`, `start-mlx-qwen35.sh`)
-
----
+- Context token guard (soft warning + hard stop)
+- Accurate token estimation
+- Concurrency limit for 27B on 64GB
+- Cold-start warning after 5 min prefill
+- OpenClaw configuration guide
 
 ## v1.4 and earlier
 

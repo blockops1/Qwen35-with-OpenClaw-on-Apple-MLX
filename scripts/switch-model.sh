@@ -26,14 +26,14 @@ GUI_ID="gui/$(id -u)"
 
 # All known vllm and proxy labels (old and new naming)
 VLLM_LABELS=(
-    "com.user.vllm-distilled"
+    "com.user.vllm"
     "com.user.vllm-instruct"
-    "com.user.mlx-vlm-server"
+    "com.user.vllm"
 )
 PROXY_LABELS=(
-    "com.user.proxy-distilled"
+    "com.user.proxy"
     "com.user.proxy-instruct"
-    "com.user.proxy-qwen35"
+    "com.user.proxy"
 )
 
 TARGET_VLLM_LABEL="com.user.vllm-${TARGET}"
@@ -107,6 +107,6 @@ fi
 
 echo ""
 echo "Note: vllm-mlx will take 2–5 min to load the model."
-echo "      Watch: tail -f ~/mlx-server/mlx-vlm-server.log"
+echo "      Watch: tail -f ~/mlx-server/vllm-server.log"
 echo ""
 echo "Done. Next Telegram session will announce: Qwen3.5 $([ "$TARGET" = "distilled" ] && echo "Claude Distilled (conversational)" || echo "Base Instruct (software development)")"
