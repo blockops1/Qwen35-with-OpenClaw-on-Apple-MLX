@@ -1,3 +1,5 @@
+
+
 # Qwen3.5 on Apple Silicon with OpenClaw
 
 Run Qwen3.5 locally on Apple Silicon (M1–M4) as the backend for an [OpenClaw](https://openclaw.ai) agent — with tool calling, context management, and auto-restart.
@@ -69,7 +71,7 @@ The proxy sits between OpenClaw and vllm-mlx and handles several things that vll
 | Qwen3.5-27B-4bit | ~16 GB | `--mllm` | Vision tasks, base model |
 | Qwen3.5-9B-Instruct-4bit | ~5 GB | `--continuous-batching` | 32GB machines, code generation |
 
-Use `scripts/detect-flag.py` to confirm the right flag for any model — the `Qwen3_5ForConditionalGeneration` architecture name appears in all Qwen3.5 configs regardless of whether vision weights are present. Don't trust the config; check the actual weights.
+Use `python3 scripts/detect-flag.py /path/to/model` to confirm the right flag for any model — the `Qwen3_5ForConditionalGeneration` architecture name appears in all Qwen3.5 configs regardless of whether vision weights are present. Don't trust the config; check the actual weights.
 
 ---
 
